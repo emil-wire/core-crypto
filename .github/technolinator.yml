@@ -3,6 +3,3 @@ gradle:
     # settings.gradle.kts to the root
     args:
         - -p ./crypto-ffi/bindings
-jdk:
-    # select JDK version used by cdxgen on JVM based projects (see below)
-    version: 17
