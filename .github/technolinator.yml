@@ -1,0 +1,8 @@
+gradle:
+    # since there's only one gradle project in this repo, we can specify it directly for cdxgen and avoid adding a
+    # settings.gradle.kts to the root
+    args:
+        - -p ./crypto-ffi/bindings
+jdk:
+    # select JDK version used by cdxgen on JVM based projects (see below)
+    version: 17
