@@ -1,22 +1,6 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
 #![doc = include_str!("../README.md")]
 
-pub use core_crypto_keystore::Connection as CryptoKeystore;
+pub use core_crypto_keystore::{Connection as CryptoKeystore, DatabaseKey};
 
 mod crypto_provider;
 mod error;
@@ -77,19 +61,18 @@ impl std::ops::DerefMut for EntropySeed {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlsCryptoProviderConfiguration<'a> {
     /// File path or database name of the persistent storage
     pub db_path: &'a str,
     /// Encryption master key of the encrypted-at-rest persistent storage
-    pub identity_key: &'a str,
+    pub db_key: DatabaseKey,
     /// Dictates whether or not the backend storage is in memory or not
     pub in_memory: bool,
     /// External seed for the ChaCha20 PRNG entropy pool
     pub entropy_seed: Option<EntropySeed>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MlsCryptoProvider {
     crypto: RustCrypto,
     key_store: CryptoKeystore,
@@ -101,9 +84,9 @@ impl MlsCryptoProvider {
     pub async fn try_new_with_configuration(config: MlsCryptoProviderConfiguration<'_>) -> MlsProviderResult<Self> {
         let crypto = config.entropy_seed.map(RustCrypto::new_with_seed).unwrap_or_default();
         let key_store = if config.in_memory {
-            CryptoKeystore::open_in_memory_with_key("", config.identity_key).await?
+            CryptoKeystore::open_in_memory_with_key("", &config.db_key).await?
         } else {
-            CryptoKeystore::open_with_key(config.db_path, config.identity_key).await?
+            CryptoKeystore::open_with_key(config.db_path, &config.db_key).await?
         };
         Ok(Self {
             crypto,
@@ -112,9 +95,9 @@ impl MlsCryptoProvider {
         })
     }
 
-    pub async fn try_new(db_path: impl AsRef<str>, identity_key: impl AsRef<str>) -> MlsProviderResult<Self> {
+    pub async fn try_new(db_path: impl AsRef<str>, db_key: &DatabaseKey) -> MlsProviderResult<Self> {
         let crypto = RustCrypto::default();
-        let key_store = CryptoKeystore::open_with_key(db_path, identity_key.as_ref()).await?;
+        let key_store = CryptoKeystore::open_with_key(db_path, db_key).await?;
         Ok(Self {
             crypto,
             key_store,
@@ -122,9 +105,9 @@ impl MlsCryptoProvider {
         })
     }
 
-    pub async fn try_new_in_memory(identity_key: impl AsRef<str>) -> MlsProviderResult<Self> {
+    pub async fn try_new_in_memory(db_key: &DatabaseKey) -> MlsProviderResult<Self> {
         let crypto = RustCrypto::default();
-        let key_store = CryptoKeystore::open_in_memory_with_key("", identity_key.as_ref()).await?;
+        let key_store = CryptoKeystore::open_in_memory_with_key("", db_key).await?;
         Ok(Self {
             crypto,
             key_store,
@@ -142,41 +125,56 @@ impl MlsCryptoProvider {
         }
     }
 
-    pub fn update_pki_env(
+    /// Clones the references of the PkiEnvironment and the CryptoProvider into a transaction
+    /// keystore to pass to openmls as the `OpenMlsCryptoProvider`
+    pub async fn new_transaction(&self) -> MlsProviderResult<()> {
+        self.key_store.new_transaction().await.map_err(Into::into)
+    }
+
+    /// Replaces the PKI env currently in place
+    pub async fn update_pki_env(
         &self,
         pki_env: wire_e2e_identity::prelude::x509::revocation::PkiEnvironment,
     ) -> MlsProviderResult<()> {
-        self.pki_env.update_env(pki_env)
+        self.pki_env.update_env(pki_env).await
+    }
+
+    /// Returns whether we have a PKI env setup
+    pub async fn is_pki_env_setup(&self) -> bool {
+        self.pki_env.is_env_setup().await
     }
 
     /// Reseeds the internal CSPRNG entropy pool with a brand new one.
     ///
     /// If [None] is provided, the new entropy will be pulled through the current OS target's capabilities
-    pub fn reseed(&mut self, entropy_seed: Option<EntropySeed>) {
-        self.crypto = entropy_seed.map(RustCrypto::new_with_seed).unwrap_or_default();
+    pub fn reseed(&self, entropy_seed: Option<EntropySeed>) -> MlsProviderResult<()> {
+        self.crypto.reseed(entropy_seed)
+    }
+
+    /// Returns whether or not it is currently possible to close this provider.
+    ///
+    /// Reasons why it may not currently be possible:
+    ///
+    /// - A transaction is currently in progress
+    /// - Multiple strong references currently exist to the keystore
+    ///
+    /// As with all such checks, this is vulnerable to TOCTOU issues, but as the current implementation
+    /// of the [`MlsCryptoProvider::close`] function consumes `self`, this is the only way to check in advance whether
+    /// this will in principle work.
+    pub async fn can_close(&self) -> bool {
+        self.key_store.can_close().await
     }
 
     /// Closes this provider, which in turns tears down the backing store
     ///
     /// Note: This does **not** destroy the data on-disk in case of persistent backing store
     pub async fn close(self) -> MlsProviderResult<()> {
-        Ok(self.key_store.close().await?)
+        self.key_store.close().await.map_err(Into::into)
     }
 
-    /// Tears down this provider and **obliterates every single piece of data stored on disk**.
-    ///
-    /// *you have been warned*
-    pub async fn destroy_and_reset(self) -> MlsProviderResult<()> {
-        Ok(self.key_store.wipe().await?)
-    }
-
-    /// Borrow keystore
-    pub fn borrow_keystore(&self) -> &CryptoKeystore {
-        &self.key_store
-    }
-
-    pub fn borrow_keystore_mut(&mut self) -> &mut CryptoKeystore {
-        &mut self.key_store
+    /// Clone keystore (its an `Arc` internnaly)
+    pub fn keystore(&self) -> CryptoKeystore {
+        self.key_store.clone()
     }
 
     /// Allows to retrieve the underlying key store directly

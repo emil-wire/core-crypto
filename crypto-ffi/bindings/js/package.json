@@ -1,0 +1,61 @@
+{
+  "name": "@wireapp/core-crypto",
+  "version": "7.0.0",
+  "author": "Wire CoreCrypto team <team.corecrypto@wire.com>",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:wireapp/core-crypto.git"
+  },
+  "main": "src/CoreCrypto.ts",
+  "module": "src/corecrypto.js",
+  "devDependencies": {
+    "@types/bun": "^1.2.16",
+    "@types/mocha": "^10.0.10",
+    "@wdio/browser-runner": "^9.15.0",
+    "@wdio/cli": "^9.15.0",
+    "@wdio/logger": "^9.15.0",
+    "@wdio/mocha-framework": "^9.15.0",
+    "@wdio/spec-reporter": "^9.15.0",
+    "@wdio/static-server-service": "^9.15.0",
+    "dts-bundle-generator": "^9.5.1",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-plugin-prettier": "^5.5.0",
+    "eslint-plugin-wdio": "^9.9.1",
+    "prettier": "^3.5.3",
+    "ts-loader": "^9.5.2",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.34.1"
+  },
+  "bugs": {
+    "url": "https://github.com/wireapp/core-crypto/issues"
+  },
+  "description": "CoreCrypto bindings for the Web",
+  "files": [
+    "src/corecrypto.js",
+    "src/corecrypto.d.ts",
+    "src/core-crypto-ffi_bg.wasm",
+    "src/core-crypto-ffi_bg.wasm.d.ts"
+  ],
+  "homepage": "https://github.com/wireapp/core-crypto",
+  "keywords": [
+    "wire",
+    "e2ee",
+    "corecrypto",
+    "mls",
+    "proteus"
+  ],
+  "license": "GPL-3.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rm -f src/corecrypto.js src/corecrypto.d.ts",
+    "build": "bun run clean && bun build --target browser --format esm --outfile src/corecrypto.js src/CoreCrypto.ts",
+    "postbuild": "bun x dts-bundle-generator --project tsconfig.json -o src/corecrypto.d.ts --no-check --export-referenced-types false src/CoreCrypto.ts",
+    "test": "bun x wdio run wdio.conf.ts --spec test/wdio/*.test.ts && bun test",
+    "bench": "bun x wdio run wdio.conf.ts --spec benches/**/*.bench.ts --log-level warn"
+  },
+  "type": "module",
+  "types": "src/corecrypto.d.ts"
+}

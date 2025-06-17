@@ -2,8 +2,8 @@
 name = "core-crypto-ffi"
 description = "Platform-specific bindings (Android, iOS, WASM) for CoreCrypto"
 repository = "https://github.com/wireapp/core-crypto"
-version = "1.0.0-rc.42"
-edition = "2021"
+version = "7.0.0"
+edition = "2024"
 license = "GPL-3.0-only"
 publish = false
 
@@ -16,17 +16,32 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 required-features = ["uniffi/cli"]
 
+[lints]
+workspace = true
+
 [features]
 default = ["proteus"]
-proteus = ["core-crypto/proteus", "core-crypto/cryptobox-migrate"]
+proteus = [
+    "core-crypto/proteus",
+    "core-crypto/cryptobox-migrate",
+    "dep:proteus-wasm",
+]
 
 [dependencies]
-thiserror = "1.0"
-cfg-if = "1.0"
-futures-util = "0.3"
-async-trait = "0.1"
-tls_codec = { workspace = true }
-async-lock = "3.0"
+thiserror.workspace = true
+cfg-if.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+tls_codec.workspace = true
+async-lock.workspace = true
+log.workspace = true
+log-reload.workspace = true
+serde_json.workspace = true
+derive_more.workspace = true
+proteus-wasm = { workspace = true, optional = true }
+core-crypto-keystore.workspace = true
+core-crypto.workspace = true
+rmp-serde.workspace = true
 
 # see https://github.com/RustCrypto/hashes/issues/404
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86")))'.dependencies]
@@ -34,20 +49,19 @@ sha2 = { version = "0.10", features = ["force-soft"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 # UniFFI - Android + iOS bindings - Runtime support
-uniffi = { workspace = true }
-core-crypto = { version = "^1.0.0-rc.42", path = "../crypto", features = ["uniffi"] }
+uniffi.workspace = true
 
 [target.wasm32-unknown-unknown.dependencies]
-wasm-bindgen = "0.2"
+wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
 js-sys = "0.3"
 web-sys = "0.3"
-strum = "0.26"
-core-crypto = { version = "^1.0.0-rc.42", path = "../crypto" }
-
+strum.workspace = true
+async-channel.workspace = true
+console_error_panic_hook.workspace = true
 
 # UniFFI - Android + iOS bindings - Build support
 [target.'cfg(not(target_family = "wasm"))'.build-dependencies.uniffi]
@@ -64,4 +78,16 @@ wasm-bindgen-test = "0.3"
 wasm-opt = false
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-Os", "--enable-mutable-globals", "--enable-threads", "--detect-features"]
+wasm-opt = [
+    "-Os",
+    "--enable-mutable-globals",
+    "--enable-threads",
+    "--detect-features",
+]
+
+[dev-dependencies]
+testing_logger = "0.1.1"
+tokio = { version = "1.45.1", default-features = false, features = [
+    "macros",
+    "rt",
+] }

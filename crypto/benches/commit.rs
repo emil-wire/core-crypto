@@ -1,6 +1,9 @@
+/// Benchmarks related to commit creation.
+/// We're measuring the impact of different parameters on the runtime.
+use std::hint::black_box;
+
 use criterion::{
-    async_executor::AsyncStdExecutor as FuturesExecutor, black_box, criterion_group, criterion_main, BatchSize,
-    Criterion,
+    BatchSize, Criterion, async_executor::AsyncStdExecutor as FuturesExecutor, criterion_group, criterion_main,
 };
 
 use crate::utils::*;
@@ -8,6 +11,7 @@ use crate::utils::*;
 #[path = "utils/mod.rs"]
 mod utils;
 
+/// Benchmark to measure the impact of group size on the runtime of creating and merging an add commit.
 fn commit_add_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit add f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -16,16 +20,16 @@ fn commit_add_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, *i).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
                             let (kp, _) = rand_key_package(ciphersuite).await;
                             (central, id, vec![kp.into()])
                         })
                     },
-                    |(mut central, id, kps)| async move {
-                        black_box(central.add_members_to_conversation(&id, kps).await.unwrap());
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                    |(central, id, kps)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(context.conversation(&id).await.unwrap().add_members(kps).await.unwrap());
+                        context.finish().await.unwrap();
                     },
                     BatchSize::LargeInput,
                 )
@@ -35,6 +39,7 @@ fn commit_add_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure impact of client count in an add commit on the runtime of commit creation and merging.
 fn commit_add_n_clients_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit add f(number clients)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -43,7 +48,7 @@ fn commit_add_n_clients_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
+                            let (central, id, _) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
                             let mut kps = Vec::with_capacity(*i);
                             for _ in 0..*i {
                                 let (kp, _) = rand_key_package(ciphersuite).await;
@@ -52,10 +57,10 @@ fn commit_add_n_clients_bench(c: &mut Criterion) {
                             (central, id, kps)
                         })
                     },
-                    |(mut central, id, kps)| async move {
-                        black_box(central.add_members_to_conversation(&id, kps).await.unwrap());
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                    |(central, id, kps)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(context.conversation(&id).await.unwrap().add_members(kps).await.unwrap());
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -65,6 +70,8 @@ fn commit_add_n_clients_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure the impact of group size on the runtime of creating and merging a remove commit.
+/// Number of removed clients is equal to group size (→ all clients except the initial client from [setup_mls] are removed).
 fn commit_remove_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit remove f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -73,20 +80,24 @@ fn commit_remove_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            let (client_ids, ..) = add_clients(&mut central, &id, ciphersuite, *i).await;
+                            let (central, id, client_ids, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
                             (central, id, client_ids)
                         })
                     },
-                    |(mut central, id, client_ids)| async move {
+                    |(central, id, client_ids)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        #[allow(clippy::unit_arg)]
                         black_box(
-                            central
-                                .remove_members_from_conversation(&id, client_ids.as_slice())
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .remove_members(&client_ids)
                                 .await
                                 .unwrap(),
                         );
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -96,6 +107,8 @@ fn commit_remove_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure impact of client count in a remove commit on the runtime of commit creation and merging.
+/// The group has size [GROUP_MAX].
 fn commit_remove_n_clients_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit remove f(number clients)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -104,21 +117,25 @@ fn commit_remove_n_clients_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            let (client_ids, ..) = add_clients(&mut central, &id, ciphersuite, GROUP_MAX).await;
+                            let (central, id, client_ids, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, GROUP_MAX).await;
                             let to_remove = client_ids[..*i].to_vec();
                             (central, id, to_remove)
                         })
                     },
-                    |(mut central, id, client_ids)| async move {
+                    |(central, id, client_ids)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        #[allow(clippy::unit_arg)]
                         black_box(
-                            central
-                                .remove_members_from_conversation(&id, client_ids.as_slice())
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .remove_members(client_ids.as_slice())
                                 .await
                                 .unwrap(),
                         );
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -128,6 +145,7 @@ fn commit_remove_n_clients_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure the impact of group size on the runtime of creating and merging an update commit.
 fn commit_update_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit update f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -136,15 +154,24 @@ fn commit_update_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, *i).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
                             (central, id)
                         })
                     },
-                    |(mut central, id)| async move {
-                        black_box(central.update_keying_material(&id).await.unwrap());
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                    |(central, id)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        #[allow(clippy::unit_arg)]
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .update_key_material()
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -154,6 +181,8 @@ fn commit_update_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure impact of pending add proposal count on the runtime of merging all pending proposals.
+/// The group has size [GROUP_MAX].
 fn commit_pending_proposals_bench_var_n_proposals(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit pending proposals f(pending size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -162,21 +191,32 @@ fn commit_pending_proposals_bench_var_n_proposals(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, GROUP_MAX).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, GROUP_MAX).await;
 
+                            let context = central.new_transaction().await.unwrap();
                             for _ in 0..*i {
                                 let (kp, ..) = rand_key_package(ciphersuite).await;
-                                central.new_add_proposal(&id, kp).await.unwrap();
+                                context.new_add_proposal(&id, kp).await.unwrap();
                             }
+                            context.finish().await.unwrap();
 
                             (central, id)
                         })
                     },
-                    |(mut central, id)| async move {
-                        black_box(central.commit_pending_proposals(&id).await.unwrap());
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                    |(central, id)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        #[allow(clippy::unit_arg)]
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .commit_pending_proposals()
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -186,6 +226,8 @@ fn commit_pending_proposals_bench_var_n_proposals(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure impact of group size on the runtime of merging all pending proposals.
+/// The proposals are [PENDING_MAX] add proposals.
 fn commit_pending_proposals_bench_var_group_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("Commit pending proposals f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -194,19 +236,30 @@ fn commit_pending_proposals_bench_var_group_size(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, *i).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
+                            let context = central.new_transaction().await.unwrap();
                             for _ in 0..PENDING_MAX {
                                 let (kp, ..) = rand_key_package(ciphersuite).await;
-                                central.new_add_proposal(&id, kp).await.unwrap();
+                                context.new_add_proposal(&id, kp).await.unwrap();
                             }
+                            context.finish().await.unwrap();
                             (central, id)
                         })
                     },
-                    |(mut central, id)| async move {
-                        black_box(central.commit_pending_proposals(&id).await.unwrap());
-                        central.commit_accepted(&id).await.unwrap();
-                        black_box(());
+                    |(central, id)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        #[allow(clippy::unit_arg)]
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .commit_pending_proposals()
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -221,7 +274,7 @@ criterion_group!(
     config = criterion();
     targets =
     commit_add_bench,
-    commit_add_n_clients_bench,
+    commit_add_n_clients_bench, // crashes with high client counts. May be enabled when experimenting with lower numbers.
     commit_remove_bench,
     commit_remove_n_clients_bench,
     commit_update_bench,

@@ -1,109 +1,263 @@
-name: Check bindings
+name: build bindings
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
-on: [push]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
-  check-android:
+  build-android:
+    uses: ./.github/workflows/build-android.yml
+
+  build-jvm-linux:
+    uses: ./.github/workflows/build-jvm-linux.yml
+
+  build-ios:
+    uses: ./.github/workflows/build-ios.yml
+
+  test-ios:
+    needs: build-ios
+    runs-on: macos-latest
+    steps:
+      - name: Cleanup on post
+        uses: gacts/run-and-post-run@v1
+        with:
+            post: |
+              sh ./scripts/clean.sh
+      - uses: actions/checkout@v4
+      - name: download artifacts for ios
+        uses: actions/download-artifact@v4
+        with:
+          path: target
+          pattern: ${{github.event.number}}-ios-*
+          merge-multiple: 'true'
+      - name: download ffi artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{github.event.number}}-swift-ffi
+          path: crypto-ffi/bindings/swift/WireCoreCryptoUniffi
+      - name: setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+            xcode-version: '16.2.0'
+      - name: lint swift bindings
+        run: |
+            cd crypto-ffi/bindings/swift/WireCoreCrypto
+            swift format lint -r . -s
+      - name: lint swift interop client
+        run: |
+          cd interop/src/clients/InteropClient
+          swift format lint -r . -s
+      - name: ios tests
+        run: |
+          cd crypto-ffi/bindings/swift/WireCoreCrypto
+          xcodebuild test -scheme TestHost -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16'
+
+  test-android:
     if: github.repository == 'wireapp/core-crypto'
     runs-on: ubuntu-latest
+    needs: build-android
     steps:
       - uses: actions/checkout@v4
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
+      - name: set up jdk 17
+        uses: actions/setup-java@v4
         with:
           java-version: "17"
           distribution: "adopt"
-      - name: Gradle Setup
-        uses: gradle/gradle-build-action@v2
-      - name: Validate Gradle wrapper
-        uses: gradle/wrapper-validation-action@v1
-      - name: "Setup rust"
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: gradle setup
+        uses: gradle/actions/setup-gradle@v4
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - uses: actions/download-artifact@v4
         with:
-          rustflags: ''
-          target: "armv7-linux-androideabi,aarch64-linux-android,x86_64-linux-android,i686-linux-android"
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Setup cargo-make
-        uses: davidB/rust-cargo-make@v1
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install NDK 25
-        run: echo "y" | sdkmanager --install "ndk;25.2.9519653"
-      - name: Build Android package
-        env:
-          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
+          name: android
+      - name: enable kvm group perms
         run: |
-          cd crypto-ffi
-          cargo make android
-      - name: Build package
-        uses: gradle/gradle-build-action@v2
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: android instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
         with:
-          build-root-directory: crypto-ffi/bindings/
-          arguments: android:build -x lint -x lintRelease
+          api-level: 32
+          arch: x86_64
+          working-directory: ./crypto-ffi/bindings
+          script: ./gradlew android:connectedAndroidTest
 
-  check-swift:
-    runs-on: macos-latest
+  build-and-test-jvm:
+    if: github.repository == 'wireapp/core-crypto'
+    runs-on: ubuntu-latest
+    needs: build-jvm-linux
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: set up jdk 17
+        uses: actions/setup-java@v4
         with:
-          rustflags: ''
-          target: "aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim"
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Setup cargo-make
-        uses: davidB/rust-cargo-make@v1
-      - run: |
-          cd crypto-ffi
-          cargo make ios
+          java-version: "17"
+          distribution: "adopt"
+      - name: gradle setup
+        uses: gradle/actions/setup-gradle@v4
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: download linux library
+        uses: actions/download-artifact@v4
+        with:
+          name: jvm-linux-so-file-${{ github.run_id }}
+          path: target/x86_64-unknown-linux-gnu/release
+      - name: download linux bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: jvm-linux-bindings-${{ github.run_id }}
+          path: crypto-ffi/bindings
+      - name: run detekt
+        run: |
+          cd crypto-ffi/bindings
+          ./gradlew jvm:detekt
+      - name: build and test jvm package
+        run: |
+          cd crypto-ffi/bindings
+          ./gradlew jvm:build -x lint -x lintRelease
 
-  check-wasm:
+  create-xcframework:
+    needs: build-ios
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: download artifacts for ios
+        uses: actions/download-artifact@v4
+        with:
+          path: target
+          pattern: ${{github.event.number}}-ios-*
+          merge-multiple: 'true'
+      - name: download ffi artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{github.event.number}}-swift-ffi
+          path: crypto-ffi/bindings/swift/WireCoreCryptoUniffi
+      - name: setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2.0'
+      - name: create xcframework
+        run: |
+          cd crypto-ffi/bindings/swift
+          ./build-xcframework.sh
+
+  e2e-interop-test:
+    runs-on: self-hosted
+    needs: build-ios
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust macOS
+        uses: ./.github/actions/setup-and-cache-rust
+        with:
+          target: "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim"
+          rustflags: ''
+          cache-key-prefix: e2e-interop-test
+      - uses: davidB/rust-cargo-make@v1
+      - name: setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2.0'
+      - name: setup wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install chrome-headless-shell
+        run: |
+          bun x @puppeteer/browsers install chrome-headless-shell@latest --path $PWD
+          echo "CHROME_PATH=$(echo $PWD/chrome-headless-shell/*/*/chrome-headless-shell)" >> $GITHUB_ENV
+      - name: Install chromedriver
+        run: |
+          bun x @puppeteer/browsers install chromedriver@latest --path $PWD
+          echo "CHROMEDRIVER_PATH=$(echo $PWD/chromedriver/*/*/chromedriver)" >> $GITHUB_ENV
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: build wasm artifacts
+        run: |
+          cd crypto-ffi
+          cargo make wasm
+      - name: download artifacts for ios
+        uses: actions/download-artifact@v4
+        with:
+          path: target
+          pattern: ${{github.event.number}}-ios-*
+          merge-multiple: 'true'
+      - name: download ffi artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{github.event.number}}-swift-ffi
+          path: crypto-ffi/bindings/swift/WireCoreCryptoUniffi
+      - name: build & install iOS Interop client
+        run: |
+          cd interop/src/clients/InteropClient
+          xcodebuild -scheme InteropClient -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' clean build install  DSTROOT=./Products
+          echo "INTEROP_SIMULATOR_DEVICE=$(./create_simulator.sh)" >> $GITHUB_ENV
+      - name: run e2e interop test
+        run: cargo run --bin interop
+      - name: delete simulator
+        if: always()
+        run: |
+          cd interop/src/clients/InteropClient
+          ./delete_simulator.sh ${{ env.INTEROP_SIMULATOR_DEVICE }}
+
+  build-and-test-wasm:
     runs-on: ubuntu-latest
     env:
       # ensures we have same flags as when publishing
       RUSTFLAGS: "-D warnings -W unreachable-pub"
     steps:
       - uses: actions/checkout@v4
-      - uses: browser-actions/setup-chrome@latest
+      - uses: wireapp/setup-chrome@master
         id: setup-chrome
         with:
           chrome-version: stable
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: ./.github/actions/setup-and-cache-rust
         with:
-          rustflags: ''
           target: wasm32-unknown-unknown
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - uses: oven-sh/setup-bun@v1
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-      - name: Setup cargo-make
-        uses: davidB/rust-cargo-make@v1
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+      - name: install wasm-pack
+        uses: taiki-e/install-action@v2
         with:
-          version: "latest"
-
-      - name: Build & test WASM / JS package
+          tool: wasm-pack
+      - uses: davidB/rust-cargo-make@v1
+      - name: build wasm
         run: |
           cd crypto-ffi
-          npm install
-          bun install
           cargo make wasm
-          bun test --bail
-
+      - name: build ts
+        run: |
+          cd crypto-ffi/bindings/js
+          bun install --frozen-lockfile
+          bun run build
+      - name: lint
+        run: |
+          cd crypto-ffi/bindings/js
+          bun eslint . --max-warnings=0
+      - name: check all ts files
+        run: |
+          cd crypto-ffi/bindings/js
+          bun tsc --noEmit
+      - name: test
+        run: |
+          cd crypto-ffi/bindings/js
+          bun run test

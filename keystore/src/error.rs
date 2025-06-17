@@ -1,24 +1,13 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
+#[cfg(target_family = "wasm")]
+use crate::keystore_v_1_0_0;
 
 /// Error to represent when a key is not present in the KeyStore
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MissingKeyErrorKind {
-    #[error("MLS KeyPackageBundle")]
-    MlsKeyPackageBundle,
+    #[error("Consumer Data")]
+    ConsumerData,
+    #[error("MLS KeyPackage")]
+    MlsKeyPackage,
     #[error("MLS SignatureKeyPair")]
     MlsSignatureKeyPair,
     #[error("MLS HpkePrivateKey")]
@@ -31,8 +20,10 @@ pub enum MissingKeyErrorKind {
     MlsPskBundle,
     #[error("MLS CredentialBundle")]
     MlsCredential,
+    #[error("MLS Buffered Commit")]
+    MlsBufferedCommit,
     #[error("MLS Persisted Group")]
-    MlsGroup,
+    PersistedMlsGroup,
     #[error("MLS Persisted Pending Group")]
     MlsPendingGroup,
     #[error("MLS Pending Messages")]
@@ -65,12 +56,14 @@ pub enum CryptoKeystoreError {
     MissingKeyInStore(#[from] MissingKeyErrorKind),
     #[error("The given key doesn't contain valid utf-8")]
     KeyReprError(#[from] std::str::Utf8Error),
+    #[error("A transaction must be in progress to perform this operation.")]
+    MutatingOperationWithoutTransaction,
+    #[error("Cannot perform the operation \"{attempted_operation:?}\" while a transaction is in progress.")]
+    TransactionInProgress { attempted_operation: String },
     #[error(transparent)]
     TryFromSliceError(#[from] std::array::TryFromSliceError),
     #[error("One of the Keystore locks has been poisoned")]
     LockPoisonError,
-    #[error("We have done something terribly wrong and it needs to be fixed")]
-    ImplementationError,
     #[error("The keystore has run out of keypackage bundles!")]
     OutOfKeyPackageBundles,
     #[error("Incorrect API usage: {0}")]
@@ -81,7 +74,8 @@ pub enum CryptoKeystoreError {
     AlreadyExists,
     #[error("The provided buffer is too big to be persisted in the store")]
     BlobTooBig,
-    #[cfg(feature = "mls-keystore")]
+    #[error("Cannot close as multiple strong refs exist")]
+    CannotClose,
     #[error(transparent)]
     KeyStoreValueTransformError(#[from] postcard::Error),
     #[error(transparent)]
@@ -95,12 +89,6 @@ pub enum CryptoKeystoreError {
     #[cfg(target_family = "wasm")]
     #[error("The task has been canceled")]
     WasmExecutorError,
-    #[cfg(target_family = "wasm")]
-    #[error("{0}")]
-    RexieError(String),
-    #[cfg(target_family = "wasm")]
-    #[error("An IndexedDB timeout has occured")]
-    RexieTimeoutError,
     #[cfg(target_family = "wasm")]
     #[error("aead::Error")]
     AesGcmError,
@@ -119,6 +107,8 @@ pub enum CryptoKeystoreError {
     #[cfg(test)]
     #[error(transparent)]
     MlsExtensionError(#[from] openmls::prelude::ExtensionError),
+    #[error("Invalid database key size, expected {expected}, got {actual}")]
+    InvalidDbKeySize { expected: usize, actual: usize },
     #[cfg(feature = "proteus-keystore")]
     #[error("Invalid key [{key}] size, expected {expected}, got {actual}")]
     InvalidKeySize {
@@ -138,10 +128,10 @@ pub enum CryptoKeystoreError {
     HexDecodeError(#[from] hex::FromHexError),
     #[error(transparent)]
     FromUtf8Error(#[from] std::string::FromUtf8Error),
-    #[cfg(feature = "ios-wal-compat")]
+    #[cfg(target_os = "ios")]
     #[error(transparent)]
     HexSaltDecodeError(hex::FromHexError),
-    #[cfg(feature = "ios-wal-compat")]
+    #[cfg(target_os = "ios")]
     #[error(transparent)]
     SecurityFrameworkError(#[from] security_framework::base::Error),
     #[cfg(target_family = "wasm")]
@@ -153,6 +143,40 @@ pub enum CryptoKeystoreError {
     TimestampError,
     #[error("Could not find {0} in keystore with value {1}")]
     NotFound(&'static str, String),
+    #[cfg(target_family = "wasm")]
+    #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+    #[cfg(target_family = "wasm")]
+    #[error(transparent)]
+    IdbError(#[from] idb::Error),
+    #[cfg(target_family = "wasm")]
+    #[error(transparent)]
+    CryptoKeystoreErrorV1_0_0(keystore_v_1_0_0::CryptoKeystoreError),
+    #[cfg(target_family = "wasm")]
+    #[error(transparent)]
+    IdbErrorCryptoKeystoreV1_0_0(idb::Error),
+    #[cfg(target_family = "wasm")]
+    #[error(transparent)]
+    RexieErrorCryptoKeystoreV1_0_0(rexie::Error),
+    #[cfg(target_family = "wasm")]
+    #[error("Migration from version {0} is not supported")]
+    MigrationNotSupported(u32),
+    #[cfg(target_family = "wasm")]
+    #[error("The migration failed.")]
+    MigrationFailed,
+}
+
+#[cfg(target_family = "wasm")]
+impl From<keystore_v_1_0_0::CryptoKeystoreError> for CryptoKeystoreError {
+    fn from(e: keystore_v_1_0_0::CryptoKeystoreError) -> Self {
+        match e {
+            keystore_v_1_0_0::CryptoKeystoreError::RexieError(rexie_error) => match rexie_error {
+                rexie::Error::IdbError(idb_error) => Self::IdbErrorCryptoKeystoreV1_0_0(idb_error),
+                _ => Self::RexieErrorCryptoKeystoreV1_0_0(rexie_error),
+            },
+            _ => Self::CryptoKeystoreErrorV1_0_0(e),
+        }
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -177,13 +201,6 @@ impl From<serde_wasm_bindgen::Error> for CryptoKeystoreError {
     }
 }
 
-#[cfg(target_family = "wasm")]
-impl From<rexie::Error> for CryptoKeystoreError {
-    fn from(rexie_err: rexie::Error) -> Self {
-        Self::RexieError(rexie_err.to_string())
-    }
-}
-
 #[cfg(feature = "proteus-keystore")]
 impl proteus_traits::ProteusErrorCode for CryptoKeystoreError {
     fn code(&self) -> proteus_traits::ProteusErrorKind {
@@ -199,7 +216,6 @@ impl proteus_traits::ProteusErrorCode for CryptoKeystoreError {
             CryptoKeystoreError::TryFromSliceError(_) => ProteusErrorKind::DecodeError,
             CryptoKeystoreError::LockPoisonError => ProteusErrorKind::OtherSystemError,
             CryptoKeystoreError::BlobTooBig => ProteusErrorKind::IoError,
-            #[cfg(feature = "mls-keystore")]
             CryptoKeystoreError::KeyStoreValueTransformError(_) => ProteusErrorKind::DecodeError,
             CryptoKeystoreError::IoError(_) => ProteusErrorKind::IoError,
             #[cfg(not(target_family = "wasm"))]

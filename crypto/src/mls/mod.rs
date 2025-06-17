@@ -1,78 +1,68 @@
-use openmls_traits::OpenMlsCryptoProvider;
-
-use mls_crypto_provider::{MlsCryptoProvider, MlsCryptoProviderConfiguration};
-
-use crate::prelude::{
-    identifier::ClientIdentifier, key_package::INITIAL_KEYING_MATERIAL_COUNT, Client, ClientId, ConversationId,
-    CoreCryptoCallbacks, CryptoError, CryptoResult, MlsCentralConfiguration, MlsCiphersuite, MlsConversation,
-    MlsConversationConfiguration, MlsCredentialType, MlsError,
+use crate::{
+    MlsError,
+    prelude::{ClientId, MlsConversation, Session},
 };
+use core_crypto_keystore::DatabaseKey;
+use mls_crypto_provider::MlsCryptoProvider;
 
-pub(crate) mod buffer_external_commit;
 pub(crate) mod ciphersuite;
-pub(crate) mod client;
-pub(crate) mod conversation;
+pub mod conversation;
 pub(crate) mod credential;
-pub(crate) mod external_commit;
-pub(crate) mod external_proposal;
+mod error;
 pub(crate) mod proposal;
-pub(crate) mod restore;
+pub(crate) mod session;
 
-// Prevents direct instantiation of [MlsCentralConfiguration]
+pub use error::{Error, Result};
+pub use session::EpochObserver;
+
+/// Prevents direct instantiation of [MlsClientConfiguration]
 pub(crate) mod config {
+    use ciphersuite::MlsCiphersuite;
     use mls_crypto_provider::EntropySeed;
 
     use super::*;
 
-    /// Configuration parameters for `MlsCentral`
+    /// Configuration parameters for [Session].
     #[derive(Debug, Clone)]
     #[non_exhaustive]
-    pub struct MlsCentralConfiguration {
+    pub struct MlsClientConfiguration {
         /// Location where the SQLite/IndexedDB database will be stored
         pub store_path: String,
-        /// Identity key to be used to instantiate the [MlsCryptoProvider]
-        pub identity_key: String,
-        /// Identifier for the client to be used by [MlsCentral]
+        /// Database key to be used to instantiate the [MlsCryptoProvider]
+        pub database_key: DatabaseKey,
+        /// Identifier for the client to be used by [Session]
         pub client_id: Option<ClientId>,
         /// Entropy pool seed for the internal PRNG
         pub external_entropy: Option<EntropySeed>,
         /// All supported ciphersuites
-        /// TODO: pending wire-server API supports selecting a ciphersuite only the first item of this array will be used.
         pub ciphersuites: Vec<ciphersuite::MlsCiphersuite>,
-        /// Number of [openmls::prelude::KeyPackage] to create when creating a MLS client. Default to [INITIAL_KEYING_MATERIAL_COUNT]
+        /// Number of [openmls::prelude::KeyPackage] to create when creating a MLS client.
+        /// Defaults to [crate::prelude::INITIAL_KEYING_MATERIAL_COUNT].
         pub nb_init_key_packages: Option<usize>,
     }
 
-    impl MlsCentralConfiguration {
+    impl MlsClientConfiguration {
         /// Creates a new instance of the configuration.
         ///
         /// # Arguments
         /// * `store_path` - location where the SQLite/IndexedDB database will be stored
-        /// * `identity_key` - identity key to be used to instantiate the [MlsCryptoProvider]
-        /// * `client_id` - identifier for the client to be used by [MlsCentral]
+        /// * `database_key` - key to be used to instantiate the [MlsCryptoProvider]
+        /// * `client_id` - identifier for the client to be used by [Session]
         /// * `ciphersuites` - Ciphersuites supported by this device
         /// * `entropy` - External source of entropy for platforms where default source insufficient
         ///
         /// # Errors
-        /// Any empty string parameter will result in a [CryptoError::MalformedIdentifier] error.
+        /// Any empty string parameter will result in a [Error::MalformedIdentifier] error.
         ///
         /// # Examples
         ///
-        /// This should fail:
         /// ```
-        /// use core_crypto::{prelude::MlsCentralConfiguration, CryptoError};
+        /// use core_crypto::prelude::{MlsClientConfiguration, MlsCiphersuite};
+        /// use core_crypto::DatabaseKey;
         ///
-        /// let result = MlsCentralConfiguration::try_new(String::new(), String::new(), Some(b"".to_vec().into()), vec![], None, Some(100));
-        /// assert!(matches!(result.unwrap_err(), CryptoError::MalformedIdentifier(_)));
-        /// ```
-        ///
-        /// This should work:
-        /// ```
-        /// use core_crypto::prelude::{MlsCentralConfiguration, CryptoError, MlsCiphersuite};
-        ///
-        /// let result = MlsCentralConfiguration::try_new(
+        /// let result = MlsClientConfiguration::try_new(
         ///     "/tmp/crypto".to_string(),
-        ///     "MY_IDENTITY_KEY".to_string(),
+        ///     DatabaseKey::generate(),
         ///     Some(b"MY_CLIENT_ID".to_vec().into()),
         ///     vec![MlsCiphersuite::default()],
         ///     None,
@@ -82,34 +72,31 @@ pub(crate) mod config {
         /// ```
         pub fn try_new(
             store_path: String,
-            identity_key: String,
+            database_key: DatabaseKey,
             client_id: Option<ClientId>,
             ciphersuites: Vec<MlsCiphersuite>,
             entropy: Option<Vec<u8>>,
             nb_init_key_packages: Option<usize>,
-        ) -> CryptoResult<Self> {
-            // TODO: probably more complex rules to enforce
+        ) -> Result<Self> {
+            // TODO: probably more complex rules to enforce. Tracking issue: WPB-9598
             if store_path.trim().is_empty() {
-                return Err(CryptoError::MalformedIdentifier("store_path"));
+                return Err(Error::MalformedIdentifier("store_path"));
             }
-            // TODO: probably more complex rules to enforce
-            if identity_key.trim().is_empty() {
-                return Err(CryptoError::MalformedIdentifier("identity_key"));
-            }
-            // TODO: probably more complex rules to enforce
+            // TODO: probably more complex rules to enforce. Tracking issue: WPB-9598
             if let Some(client_id) = client_id.as_ref() {
                 if client_id.is_empty() {
-                    return Err(CryptoError::MalformedIdentifier("client_id"));
+                    return Err(Error::MalformedIdentifier("client_id"));
                 }
             }
             let external_entropy = entropy
                 .as_deref()
                 .map(|seed| &seed[..EntropySeed::EXPECTED_LEN])
                 .map(EntropySeed::try_from_slice)
-                .transpose()?;
+                .transpose()
+                .map_err(MlsError::wrap("gathering external entropy"))?;
             Ok(Self {
                 store_path,
-                identity_key,
+                database_key,
                 client_id,
                 ciphersuites,
                 external_entropy,
@@ -134,409 +121,95 @@ pub(crate) mod config {
     }
 }
 
-/// The entry point for the MLS CoreCrypto library. This struct provides all functionality to create
-/// and manage groups, make proposals and commits.
-#[derive(Debug)]
-pub struct MlsCentral {
-    pub(crate) mls_client: Option<Client>,
-    pub(crate) mls_backend: MlsCryptoProvider,
-    pub(crate) mls_groups: crate::group_store::GroupStore<MlsConversation>,
-    pub(crate) callbacks: Option<Box<dyn CoreCryptoCallbacks + 'static>>,
-}
-
-impl MlsCentral {
-    /// Tries to initialize the MLS Central object.
-    /// Takes a store path (i.e. Disk location of the embedded database, should be consistent between messaging sessions)
-    /// And a root identity key (i.e. enclaved encryption key for this device)
-    ///
-    /// # Arguments
-    /// * `configuration` - the configuration for the `MlsCentral`
-    ///
-    /// # Errors
-    /// Failures in the initialization of the KeyStore can cause errors, such as IO, the same kind
-    /// of errors can happen when the groups are being restored from the KeyStore or even during
-    /// the client initialization (to fetch the identity signature). Other than that, `MlsError`
-    /// can be caused by group deserialization or during the initialization of the credentials:
-    /// * for x509 Credentials if the cetificate chain length is lower than 2
-    /// * for Basic Credentials if the signature key cannot be generated either by not supported
-    /// scheme or the key generation fails
-    pub async fn try_new(configuration: MlsCentralConfiguration) -> CryptoResult<Self> {
-        // Init backend (crypto + rand + keystore)
-        let mls_backend = MlsCryptoProvider::try_new_with_configuration(MlsCryptoProviderConfiguration {
-            db_path: &configuration.store_path,
-            identity_key: &configuration.identity_key,
-            in_memory: false,
-            entropy_seed: configuration.external_entropy,
-        })
-        .await?;
-        let mls_client = if let Some(id) = configuration.client_id {
-            // Init client identity (load or create)
-            Some(
-                Client::init(
-                    ClientIdentifier::Basic(id),
-                    configuration.ciphersuites.as_slice(),
-                    &mls_backend,
-                    configuration
-                        .nb_init_key_packages
-                        .unwrap_or(INITIAL_KEYING_MATERIAL_COUNT),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        // Restore persisted groups if there are any
-        let mls_groups = Self::restore_groups(&mls_backend).await?;
-        mls_backend
-            .authentication_service()
-            .update_env(Self::restore_pki_env(&mls_backend).await?)?;
-
-        Ok(Self {
-            mls_backend,
-            mls_client,
-            mls_groups,
-            callbacks: None,
-        })
-    }
-
-    /// Same as the [MlsCentral::try_new] but instead, it uses an in memory KeyStore. Although required, the `store_path` parameter from the `MlsCentralConfiguration` won't be used here.
-    pub async fn try_new_in_memory(configuration: MlsCentralConfiguration) -> CryptoResult<Self> {
-        let mls_backend = MlsCryptoProvider::try_new_with_configuration(MlsCryptoProviderConfiguration {
-            db_path: &configuration.store_path,
-            identity_key: &configuration.identity_key,
-            in_memory: true,
-            entropy_seed: configuration.external_entropy,
-        })
-        .await?;
-        let mls_client = if let Some(id) = configuration.client_id {
-            Some(
-                Client::init(
-                    ClientIdentifier::Basic(id),
-                    configuration.ciphersuites.as_slice(),
-                    &mls_backend,
-                    configuration
-                        .nb_init_key_packages
-                        .unwrap_or(INITIAL_KEYING_MATERIAL_COUNT),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let mls_groups = Self::restore_groups(&mls_backend).await?;
-        mls_backend
-            .authentication_service()
-            .update_env(Self::restore_pki_env(&mls_backend).await?)?;
-
-        Ok(Self {
-            mls_backend,
-            mls_client,
-            mls_groups,
-            callbacks: None,
-        })
-    }
-
-    /// Initializes the MLS client if [super::CoreCrypto] has previously been initialized with
-    /// `CoreCrypto::deferred_init` instead of `CoreCrypto::new`.
-    /// This should stay as long as proteus is supported. Then it should be removed.
-    pub async fn mls_init(
-        &mut self,
-        identifier: ClientIdentifier,
-        ciphersuites: Vec<MlsCiphersuite>,
-        nb_init_key_packages: Option<usize>,
-    ) -> CryptoResult<()> {
-        if self.mls_client.is_some() {
-            // prevents wrong usage of the method instead of silently hiding the mistake
-            return Err(CryptoError::ConsumerError);
-        }
-        let nb_key_package = nb_init_key_packages.unwrap_or(INITIAL_KEYING_MATERIAL_COUNT);
-        let mls_client = Client::init(identifier, &ciphersuites, &self.mls_backend, nb_key_package).await?;
-
-        if mls_client.is_e2ei_capable() {
-            self.init_pki_env().await?;
-        }
-
-        self.mls_client.replace(mls_client);
-
-        Ok(())
-    }
-
-    /// Generates MLS KeyPairs/CredentialBundle with a temporary, random client ID.
-    /// This method is designed to be used in conjunction with [MlsCentral::mls_init_with_client_id] and represents the first step in this process.
-    ///
-    /// This returns the TLS-serialized identity keys (i.e. the signature keypair's public key)
-    #[cfg_attr(test, crate::dispotent)]
-    pub async fn mls_generate_keypairs(&self, ciphersuites: Vec<MlsCiphersuite>) -> CryptoResult<Vec<ClientId>> {
-        if self.mls_client.is_some() {
-            // prevents wrong usage of the method instead of silently hiding the mistake
-            return Err(CryptoError::ConsumerError);
-        }
-
-        Client::generate_raw_keypairs(&ciphersuites, &self.mls_backend).await
-    }
-
-    /// Updates the current temporary Client ID with the newly provided one. This is the second step in the externally-generated clients process
-    ///
-    /// Important: This is designed to be called after [MlsCentral::mls_generate_keypairs]
-    #[cfg_attr(test, crate::dispotent)]
-    pub async fn mls_init_with_client_id(
-        &mut self,
-        client_id: ClientId,
-        tmp_client_ids: Vec<ClientId>,
-        ciphersuites: Vec<MlsCiphersuite>,
-    ) -> CryptoResult<()> {
-        if self.mls_client.is_some() {
-            // prevents wrong usage of the method instead of silently hiding the mistake
-            return Err(CryptoError::ConsumerError);
-        }
-
-        let mls_client =
-            Client::init_with_external_client_id(client_id, tmp_client_ids, &ciphersuites, &self.mls_backend).await?;
-
-        self.mls_client = Some(mls_client);
-        Ok(())
-    }
-
-    /// Sets the consumer callbacks (i.e authorization callbacks for CoreCrypto to perform authorization calls when needed)
-    ///
-    /// # Arguments
-    /// * `callbacks` - a callback to be called to perform authorization
-    pub fn callbacks(&mut self, callbacks: Box<dyn CoreCryptoCallbacks>) {
-        self.callbacks = Some(callbacks);
-    }
-
-    /// Returns the client's most recent public signature key as a buffer.
-    /// Used to upload a public key to the server in order to verify client's messages signature.
-    ///
-    /// # Arguments
-    /// * `ciphersuite` - a callback to be called to perform authorization
-    /// * `credential_type` - of the credential to look for
-    pub fn client_public_key(
-        &self,
-        ciphersuite: MlsCiphersuite,
-        credential_type: MlsCredentialType,
-    ) -> CryptoResult<Vec<u8>> {
-        let mls_client = self.mls_client()?;
-        let cb = mls_client
-            .find_most_recent_credential_bundle(ciphersuite.signature_algorithm(), credential_type)
-            .ok_or(CryptoError::ClientSignatureNotFound)?;
-        Ok(cb.signature_key.to_public_vec())
-    }
-
-    /// Returns the client's id as a buffer
-    pub fn client_id(&self) -> CryptoResult<ClientId> {
-        Ok(self.mls_client()?.id().clone())
-    }
-
-    /// Create a new empty conversation
-    ///
-    /// # Arguments
-    /// * `id` - identifier of the group/conversation (must be unique otherwise the existing group
-    /// will be overridden)
-    /// * `creator_credential_type` - kind of credential the creator wants to create the group with
-    /// * `config` - configuration of the group/conversation
-    ///
-    /// # Errors
-    /// Errors can happen from the KeyStore or from OpenMls for ex if no [openmls::key_packages::KeyPackage] can
-    /// be found in the KeyStore
-    #[cfg_attr(test, crate::dispotent)]
-    pub async fn new_conversation(
-        &mut self,
-        id: &ConversationId,
-        creator_credential_type: MlsCredentialType,
-        config: MlsConversationConfiguration,
-    ) -> CryptoResult<()> {
-        if self.conversation_exists(id).await || self.pending_group_exists(id).await {
-            return Err(CryptoError::ConversationAlreadyExists(id.clone()));
-        }
-
-        let mls_client = self.mls_client.as_mut().ok_or(CryptoError::MlsNotInitialized)?;
-        let conversation = MlsConversation::create(
-            id.clone(),
-            mls_client,
-            creator_credential_type,
-            config,
-            &self.mls_backend,
-        )
-        .await?;
-
-        self.mls_groups.insert(id.clone(), conversation);
-
-        Ok(())
-    }
-
-    /// Checks if a given conversation id exists locally
-    pub async fn conversation_exists(&mut self, id: &ConversationId) -> bool {
-        self.mls_groups
-            .get_fetch(id, self.mls_backend.borrow_keystore_mut(), None)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
-    /// Returns the epoch of a given conversation
-    ///
-    /// # Errors
-    /// If the conversation can't be found
-    #[cfg_attr(test, crate::idempotent)]
-    pub async fn conversation_epoch(&mut self, id: &ConversationId) -> CryptoResult<u64> {
-        Ok(self
-            .mls_groups
-            .get_fetch(id, self.mls_backend.borrow_keystore_mut(), None)
-            .await?
-            .ok_or_else(|| CryptoError::ConversationNotFound(id.to_owned()))?
-            .read()
-            .await
-            .group
-            .epoch()
-            .as_u64())
-    }
-
-    /// Closes the connection with the local KeyStore
-    ///
-    /// # Errors
-    /// KeyStore errors, such as IO
-    pub async fn close(self) -> CryptoResult<()> {
-        self.mls_backend.close().await?;
-        Ok(())
-    }
-
-    /// Destroys everything we have, in-memory and on disk.
-    ///
-    /// # Errors
-    /// KeyStore errors, such as IO
-    pub async fn wipe(self) -> CryptoResult<()> {
-        self.mls_backend.destroy_and_reset().await?;
-        Ok(())
-    }
-
-    /// Generates a random byte array of the specified size
-    pub fn random_bytes(&self, len: usize) -> CryptoResult<Vec<u8>> {
-        use openmls_traits::random::OpenMlsRand as _;
-        Ok(self.mls_backend.rand().random_vec(len)?)
-    }
-
-    /// Returns a reference for the internal Crypto Provider
-    pub fn provider(&self) -> &MlsCryptoProvider {
-        &self.mls_backend
-    }
-
-    /// Returns a mutable reference for the internal Crypto Provider
-    pub fn provider_mut(&mut self) -> &mut MlsCryptoProvider {
-        &mut self.mls_backend
-    }
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+pub(crate) trait HasSessionAndCrypto: Send {
+    async fn session(&self) -> Result<Session>;
+    async fn crypto_provider(&self) -> Result<MlsCryptoProvider>;
 }
 
 #[cfg(test)]
-pub mod tests {
-    use wasm_bindgen_test::*;
+mod tests {
+    use crate::transaction_context::Error as TransactionError;
 
-    use crate::prelude::{CertificateBundle, ClientIdentifier, MlsCredentialType, INITIAL_KEYING_MATERIAL_COUNT};
+    use crate::prelude::{
+        CertificateBundle, ClientIdentifier, INITIAL_KEYING_MATERIAL_COUNT, MlsClientConfiguration, MlsCredentialType,
+    };
     use crate::{
-        mls::{CryptoError, MlsCentral, MlsCentralConfiguration},
+        CoreCrypto,
+        mls::Session,
         test_utils::{x509::X509TestChain, *},
     };
 
-    wasm_bindgen_test_configure!(run_in_browser);
+    use core_crypto_keystore::DatabaseKey;
 
-    pub mod conversation_epoch {
+    mod conversation_epoch {
         use super::*;
+        use crate::mls::conversation::Conversation as _;
 
         #[apply(all_cred_cipher)]
-        #[wasm_bindgen_test]
-        pub async fn can_get_newly_created_conversation_epoch(case: TestCase) {
-            run_test_with_central(case.clone(), move |[mut central]| {
-                Box::pin(async move {
-                    let id = conversation_id();
-                    central
-                        .mls_central
-                        .new_conversation(&id, case.credential_type, case.cfg.clone())
-                        .await
-                        .unwrap();
-                    let epoch = central.mls_central.conversation_epoch(&id).await.unwrap();
-                    assert_eq!(epoch, 0);
-                })
+        async fn can_get_newly_created_conversation_epoch(case: TestContext) {
+            let [session] = case.sessions().await;
+            let conversation = case.create_conversation([&session]).await;
+            let epoch = conversation.guard().await.epoch().await;
+            assert_eq!(epoch, 0);
+        }
+
+        #[apply(all_cred_cipher)]
+        async fn can_get_conversation_epoch(case: TestContext) {
+            let [alice, bob] = case.sessions().await;
+            Box::pin(async move {
+                let conversation = case.create_conversation([&alice, &bob]).await;
+                let epoch = conversation.guard().await.epoch().await;
+                assert_eq!(epoch, 1);
             })
             .await;
         }
 
         #[apply(all_cred_cipher)]
-        #[wasm_bindgen_test]
-        pub async fn can_get_conversation_epoch(case: TestCase) {
-            run_test_with_client_ids(
-                case.clone(),
-                ["alice", "bob"],
-                move |[mut alice_central, mut bob_central]| {
-                    Box::pin(async move {
-                        let id = conversation_id();
-                        alice_central
-                            .mls_central
-                            .new_conversation(&id, case.credential_type, case.cfg.clone())
-                            .await
-                            .unwrap();
-                        alice_central
-                            .mls_central
-                            .invite_all(&case, &id, [&mut bob_central.mls_central])
-                            .await
-                            .unwrap();
-                        let epoch = alice_central.mls_central.conversation_epoch(&id).await.unwrap();
-                        assert_eq!(epoch, 1);
-                    })
-                },
-            )
-            .await;
-        }
-
-        #[apply(all_cred_cipher)]
-        #[wasm_bindgen_test]
-        pub async fn conversation_not_found(case: TestCase) {
-            run_test_with_central(case.clone(), move |[mut central]| {
-                Box::pin(async move {
-                    let id = conversation_id();
-                    let err = central.mls_central.conversation_epoch(&id).await.unwrap_err();
-                    assert!(matches!(err, CryptoError::ConversationNotFound(conv_id) if conv_id == id));
-                })
-            })
-            .await;
+        async fn conversation_not_found(case: TestContext) {
+            use crate::LeafError;
+            let [session] = case.sessions().await;
+            let id = conversation_id();
+            let err = session.transaction.conversation(&id).await.unwrap_err();
+            assert!(matches!(
+                err,
+                TransactionError::Leaf(LeafError::ConversationNotFound(i)) if i == id
+            ));
         }
     }
 
-    pub mod invariants {
-        use crate::prelude::MlsCiphersuite;
+    mod invariants {
+        use crate::{mls, prelude::MlsCiphersuite};
 
         use super::*;
 
         #[apply(all_cred_cipher)]
-        #[wasm_bindgen_test]
-        pub async fn can_create_from_valid_configuration(case: TestCase) {
-            run_tests(move |[tmp_dir_argument]| {
-                Box::pin(async move {
-                    let configuration = MlsCentralConfiguration::try_new(
-                        tmp_dir_argument,
-                        "test".to_string(),
-                        Some("alice".into()),
-                        vec![case.ciphersuite()],
-                        None,
-                        Some(INITIAL_KEYING_MATERIAL_COUNT),
-                    )
-                    .unwrap();
+        async fn can_create_from_valid_configuration(mut case: TestContext) {
+            let tmp_dir = case.tmp_dir().await;
+            Box::pin(async move {
+                let configuration = MlsClientConfiguration::try_new(
+                    tmp_dir,
+                    DatabaseKey::generate(),
+                    Some("alice".into()),
+                    vec![case.ciphersuite()],
+                    None,
+                    Some(INITIAL_KEYING_MATERIAL_COUNT),
+                )
+                .unwrap();
 
-                    let central = MlsCentral::try_new(configuration).await;
-                    assert!(central.is_ok())
-                })
+                let new_client_result = Session::try_new(configuration).await;
+                assert!(new_client_result.is_ok())
             })
             .await
         }
 
         #[test]
-        #[wasm_bindgen_test]
-        pub fn store_path_should_not_be_empty_nor_blank() {
+        fn store_path_should_not_be_empty_nor_blank() {
             let ciphersuites = vec![MlsCiphersuite::default()];
-            let configuration = MlsCentralConfiguration::try_new(
+            let configuration = MlsClientConfiguration::try_new(
                 " ".to_string(),
-                "test".to_string(),
+                DatabaseKey::generate(),
                 Some("alice".into()),
                 ciphersuites,
                 None,
@@ -544,150 +217,120 @@ pub mod tests {
             );
             assert!(matches!(
                 configuration.unwrap_err(),
-                CryptoError::MalformedIdentifier("store_path")
+                mls::Error::MalformedIdentifier("store_path")
             ));
         }
 
-        #[cfg_attr(not(target_family = "wasm"), async_std::test)]
-        #[wasm_bindgen_test]
-        pub async fn identity_key_should_not_be_empty_nor_blank() {
-            run_tests(|[tmp_dir_argument]| {
-                Box::pin(async move {
-                    let ciphersuites = vec![MlsCiphersuite::default()];
-                    let configuration = MlsCentralConfiguration::try_new(
-                        tmp_dir_argument,
-                        " ".to_string(),
-                        Some("alice".into()),
-                        ciphersuites,
-                        None,
-                        Some(INITIAL_KEYING_MATERIAL_COUNT),
-                    );
-                    assert!(matches!(
-                        configuration.unwrap_err(),
-                        CryptoError::MalformedIdentifier("identity_key")
-                    ));
-                })
-            })
-            .await
-        }
-
-        #[cfg_attr(not(target_family = "wasm"), async_std::test)]
-        #[wasm_bindgen_test]
-        pub async fn client_id_should_not_be_empty() {
-            run_tests(|[tmp_dir_argument]| {
-                Box::pin(async move {
-                    let ciphersuites = vec![MlsCiphersuite::default()];
-                    let configuration = MlsCentralConfiguration::try_new(
-                        tmp_dir_argument,
-                        "test".to_string(),
-                        Some("".into()),
-                        ciphersuites,
-                        None,
-                        Some(INITIAL_KEYING_MATERIAL_COUNT),
-                    );
-                    assert!(matches!(
-                        configuration.unwrap_err(),
-                        CryptoError::MalformedIdentifier("client_id")
-                    ));
-                })
+        #[async_std::test]
+        async fn client_id_should_not_be_empty() {
+            let mut case = TestContext::default();
+            let tmp_dir = case.tmp_dir().await;
+            Box::pin(async move {
+                let ciphersuites = vec![MlsCiphersuite::default()];
+                let configuration = MlsClientConfiguration::try_new(
+                    tmp_dir,
+                    DatabaseKey::generate(),
+                    Some("".into()),
+                    ciphersuites,
+                    None,
+                    Some(INITIAL_KEYING_MATERIAL_COUNT),
+                );
+                assert!(matches!(
+                    configuration.unwrap_err(),
+                    mls::Error::MalformedIdentifier("client_id")
+                ));
             })
             .await
         }
     }
 
     #[apply(all_cred_cipher)]
-    #[wasm_bindgen_test]
-    pub async fn create_conversation_should_fail_when_already_exists(case: TestCase) {
-        run_test_with_client_ids(case.clone(), ["alice"], move |[mut alice_central]| {
-            Box::pin(async move {
-                let id = conversation_id();
+    async fn create_conversation_should_fail_when_already_exists(case: TestContext) {
+        use crate::LeafError;
 
-                let create = alice_central
-                    .mls_central
-                    .new_conversation(&id, case.credential_type, case.cfg.clone())
-                    .await;
-                assert!(create.is_ok());
+        let [alice] = case.sessions().await;
+        Box::pin(async move {
+            let conversation = case.create_conversation([&alice]).await;
+            let id = conversation.id().clone();
 
                 // creating a conversation should first verify that the conversation does not already exist ; only then create it
-                let repeat_create = alice_central
-                    .mls_central
+                let repeat_create = alice
+                    .transaction
                     .new_conversation(&id, case.credential_type, case.cfg.clone())
                     .await;
-                assert!(matches!(repeat_create.unwrap_err(), CryptoError::ConversationAlreadyExists(i) if i == id));
+                assert!(matches!(repeat_create.unwrap_err(), TransactionError::Leaf(LeafError::ConversationAlreadyExists(i)) if i == id));
             })
-        })
         .await;
     }
 
     #[apply(all_cred_cipher)]
-    #[wasm_bindgen_test]
-    pub async fn can_fetch_client_public_key(case: TestCase) {
-        run_tests(move |[tmp_dir_argument]| {
-            Box::pin(async move {
-                let configuration = MlsCentralConfiguration::try_new(
-                    tmp_dir_argument,
-                    "test".to_string(),
-                    Some("potato".into()),
-                    vec![case.ciphersuite()],
-                    None,
-                    Some(INITIAL_KEYING_MATERIAL_COUNT),
-                )
-                .unwrap();
+    async fn can_fetch_client_public_key(mut case: TestContext) {
+        let tmp_dir = case.tmp_dir().await;
+        Box::pin(async move {
+            let configuration = MlsClientConfiguration::try_new(
+                tmp_dir,
+                DatabaseKey::generate(),
+                Some("potato".into()),
+                vec![case.ciphersuite()],
+                None,
+                Some(INITIAL_KEYING_MATERIAL_COUNT),
+            )
+            .unwrap();
 
-                let result = MlsCentral::try_new(configuration.clone()).await;
-                assert!(result.is_ok());
-            })
+            let result = Session::try_new(configuration.clone()).await;
+            println!("{:?}", result);
+            assert!(result.is_ok());
         })
         .await
     }
 
     #[apply(all_cred_cipher)]
-    #[wasm_bindgen_test]
-    pub async fn can_2_phase_init_central(case: TestCase) {
-        run_tests(move |[tmp_dir_argument]| {
-            Box::pin(async move {
-                let x509_test_chain = X509TestChain::init_empty(case.signature_scheme());
-                let configuration = MlsCentralConfiguration::try_new(
-                    tmp_dir_argument,
-                    "test".to_string(),
-                    None,
+    async fn can_2_phase_init_central(mut case: TestContext) {
+        let tmp_dir = case.tmp_dir().await;
+        Box::pin(async move {
+            let x509_test_chain = X509TestChain::init_empty(case.signature_scheme());
+            let configuration = MlsClientConfiguration::try_new(
+                tmp_dir,
+                DatabaseKey::generate(),
+                None,
+                vec![case.ciphersuite()],
+                None,
+                Some(INITIAL_KEYING_MATERIAL_COUNT),
+            )
+            .unwrap();
+            // phase 1: init without initialized mls_client
+            let client = Session::try_new(configuration).await.unwrap();
+            let cc = CoreCrypto::from(client);
+            let context = cc.new_transaction().await.unwrap();
+            x509_test_chain.register_with_central(&context).await;
+
+            assert!(!context.session().await.unwrap().is_ready().await);
+            // phase 2: init mls_client
+            let client_id = "alice";
+            let identifier = match case.credential_type {
+                MlsCredentialType::Basic => ClientIdentifier::Basic(client_id.into()),
+                MlsCredentialType::X509 => {
+                    CertificateBundle::rand_identifier(client_id, &[x509_test_chain.find_local_intermediate_ca()])
+                }
+            };
+            context
+                .mls_init(
+                    identifier,
                     vec![case.ciphersuite()],
-                    None,
                     Some(INITIAL_KEYING_MATERIAL_COUNT),
                 )
+                .await
                 .unwrap();
-                // phase 1: init without mls_client
-                let mut central = MlsCentral::try_new(configuration).await.unwrap();
-                x509_test_chain.register_with_central(&central).await;
-
-                assert!(central.mls_client.is_none());
-                // phase 2: init mls_client
-                let client_id = "alice";
-                let identifier = match case.credential_type {
-                    MlsCredentialType::Basic => ClientIdentifier::Basic(client_id.into()),
-                    MlsCredentialType::X509 => {
-                        CertificateBundle::rand_identifier(client_id, &[x509_test_chain.find_local_intermediate_ca()])
-                    }
-                };
-                central
-                    .mls_init(
-                        identifier,
-                        vec![case.ciphersuite()],
-                        Some(INITIAL_KEYING_MATERIAL_COUNT),
-                    )
+            assert!(context.session().await.unwrap().is_ready().await);
+            // expect mls_client to work
+            assert_eq!(
+                context
+                    .get_or_create_client_keypackages(case.ciphersuite(), case.credential_type, 2)
                     .await
-                    .unwrap();
-                assert!(central.mls_client.is_some());
-                // expect mls_client to work
-                assert_eq!(
-                    central
-                        .get_or_create_client_keypackages(case.ciphersuite(), case.credential_type, 2)
-                        .await
-                        .unwrap()
-                        .len(),
-                    2
-                );
-            })
+                    .unwrap()
+                    .len(),
+                2
+            );
         })
         .await
     }

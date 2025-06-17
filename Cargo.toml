@@ -2,95 +2,85 @@
 members = [
     "crypto",
     "crypto-ffi",
-    "crypto-attributes",
+    "crypto-macros",
     "keystore",
     "keystore-dump",
     "mls-provider",
-    "interop"
-]
-exclude = [
-    "xtask",
-    "extras/core-ds",
-    "extras/wasm-browser-run",
-    "extras/wasm-browser-test-runner",
-    "extras/keystore-regression-versions"
+    "interop",
+    "decode",
 ]
 resolver = "2"
 
+[workspace.lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(wasm_bindgen_unstable_test_coverage)',
+] }
+
 [workspace.dependencies]
-tls_codec = "0.4.0"
+async-channel = "2.3.1"
+async-lock = "3.4"
+async-recursion = "1"
+async-std = "1.13"
+async-trait = "0.1"
+base64 = "0.22"
+bitflags = "2.9"
+cfg-if = "1.0"
+console_error_panic_hook = "0.1.7"
+const_format = "0.2"
+core-crypto = { path = "crypto" }
+core-crypto-keystore = { path = "keystore" }
+core-crypto-macros = { path = "crypto-macros" }
+derive_more = { version = "2.0", features = [
+    "from",
+    "into",
+    "constructor",
+    "display",
+    "debug",
+    "as_ref",
+    "deref",
+    "deref_mut",
+] }
+futures-util = "0.3"
+hex = "0.4"
+idb = "0.6"
+indexmap = "2"
+itertools = "0.13"
+log = { version = "0.4", features = ["kv_serde"] }
+log-reload = "0.1.3"
+mls-crypto-provider = { path = "mls-provider" }
+pem = "3.0"
+rand = { version = "0.8", features = ["getrandom"] }
+rexie = "0.6.1" # TODO: remove once migration tests have been moved to rexie
+rmp-serde = "1.3.0"
+schnellru = "0.2"
+serde = "1.0"
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+strum = { version = "0.26", features = ["derive"] }
+thiserror = "2.0"
+tls_codec = "0.4.2"
+uniffi = "0.29"
+url = "2.5"
+uuid = "1.17"
+x509-cert = "0.2"
+zeroize = "1.8"
 
-[workspace.dependencies.uniffi]
-version = "0.24"
-git = "https://github.com/wireapp/uniffi-rs.git"
-branch = "wire/uniffi-stable"
+# our OpenMLS fork
+openmls = { git = "https://github.com/wireapp/openmls", rev = "c47c884649b2403a180407632470a42b768ce2a4", version = "1" }
+openmls_traits = { git = "https://github.com/wireapp/openmls", rev = "c47c884649b2403a180407632470a42b768ce2a4", version = "0.2" }
+openmls_basic_credential = { git = "https://github.com/wireapp/openmls", rev = "c47c884649b2403a180407632470a42b768ce2a4", version = "0.2" }
+openmls_x509_credential = { git = "https://github.com/wireapp/openmls", rev = "c47c884649b2403a180407632470a42b768ce2a4", version = "0.2" }
 
-[patch.crates-io.schnellru]
-git = "https://github.com/wireapp/schnellru"
-branch = "feat/try-insert"
+# proteus
+proteus-traits = { git = "https://github.com/wireapp/proteus", tag = "v2.1.1" }
+proteus-wasm = { git = "https://github.com/wireapp/proteus", tag = "v2.1.1" }
 
-[patch.crates-io.rexie]
-git = "https://github.com/wireapp/rexie"
-branch = "feat/api-expansion"
-
-[patch.'https://github.com/wireapp/proteus'.proteus]
-package = "proteus"
-# Keep the extra / in the url, it prevents this error:
-# `patch for `proteus` in `https://github.com/wireapp/proteus` points to the same source, but patches must point to different sources`
-git = "https://github.com/wireapp//proteus"
-branch = "otak/fix-1.0.3"
-
-[patch.crates-io.proteus-traits]
-package = "proteus-traits"
-git = "https://github.com/wireapp/proteus"
-branch = "2.x"
-
-[patch.crates-io.openmls]
-package = "openmls"
-git = "https://github.com/wireapp/openmls"
-#tag = "v1.0.0-pre.core-crypto-1.0.0"
-branch = "wire/stable"
-
-[patch.crates-io.openmls_traits]
-package = "openmls_traits"
-git = "https://github.com/wireapp/openmls"
-#tag = "v1.0.0-pre.core-crypto-1.0.0"
-branch = "wire/stable"
-
-[patch.crates-io.openmls_basic_credential]
-package = "openmls_basic_credential"
-git = "https://github.com/wireapp/openmls"
-#tag = "v1.0.0-pre.core-crypto-1.0.0"
-branch = "wire/stable"
-
-[patch.crates-io.openmls_x509_credential]
-package = "openmls_x509_credential"
-git = "https://github.com/wireapp/openmls"
-#tag = "v1.0.0-pre.core-crypto-1.0.0"
-branch = "wire/stable"
-
-[patch.crates-io.hpke]
-git = "https://github.com/wireapp/rust-hpke.git"
-branch = "wire/unstable-pq-xyber"
-
-[patch.crates-io.wire-e2e-identity]
-package = "wire-e2e-identity"
-git = "https://github.com/wireapp/rusty-jwt-tools"
-branch = "main"
-
-[patch.crates-io.x509-cert]
-git = "https://github.com/otak/formats"
-branch = "otak/x509-cert-wasm"
-
-# aarch64-apple-ios-sim target support has not yet been released
-[patch.crates-io.openssl-src]
-git = "https://github.com/alexcrichton/openssl-src-rs.git"
-branch = "release/111"
-package = "openssl-src"
-
-[patch.crates-io.jwt-simple]
-git = "https://github.com/wireapp/rust-jwt-simple"
-tag = "v0.12.1-pre.core-crypto-1.0.0"
+wire-e2e-identity = { git = "https://github.com/wireapp/rusty-jwt-tools", tag = "v0.13.0" }
 
 [profile.release]
 lto = true

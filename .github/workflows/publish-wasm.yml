@@ -1,7 +1,7 @@
-name: Publish Node packages
+name: publish node packages
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: "${{ github.workflow }}-${{ github.ref }}"
 
 on:
   push:
@@ -15,8 +15,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   publish-wasm:
@@ -24,39 +22,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: force-fetch the tag to work around actions/checkout#290
+        run: git fetch -f origin ${{ github.ref }}:${{ github.ref }}
+      - name: ensure the tag is signed
+        run: git cat-file tag ${{ github.ref_name }} | grep -q -- '-----BEGIN PGP SIGNATURE-----'
+      - uses: ./.github/actions/setup-and-cache-rust
         with:
-          node-version: 18
-
-      - uses: oven-sh/setup-bun@v1
+          target: wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: install wasm-pack
+        uses: taiki-e/install-action@v2
         with:
-          rustflags: ''
-          target: wasm32-unknown-unknown
-
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-
-      - name: Setup cargo-make
-        uses: davidB/rust-cargo-make@v1
-
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: "latest"
-
-      - name: Build WASM package
+          tool: wasm-pack
+      - uses: davidB/rust-cargo-make@v1
+      - name: build wasm
         run: |
           cd crypto-ffi
-          bun install
           cargo make wasm
-
-      - name: Publishes package to NPM
+          cd bindings/js
+          bun run build
+      - name: publishes package to npm
         uses: JS-DevTools/npm-publish@v3
         with:
           token: ${{ secrets.NPM_TOKEN }}
           access: public
+          package: "crypto-ffi/bindings/js/package.json"

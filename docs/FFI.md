@@ -1,12 +1,16 @@
 # CoreCrypto FFI Details
 
-## Bindings
+## Rust Docs
 
-* WASM / TypeScript bindings are self-documented in [crypto-ffi/bindings/js/CoreCrypto.ts].
-    * Please refer to your IDE of choice's inlay hints or simply check out the `TypeDoc`-generated documentation on [typescript]
-    * Naming convention wise, `snake_case` gets translated to the TS idiomatic `camelCase` for methods and `PascalCase` for classes/interfaces
-* UniFFI-generated bindings (Swift, Kotlin) share the same characteristics in terms of naming convention translation.
-    * The general convention is that the idiomatic Rust `snake_case` gets translated to the language's idiomatic convention. Fortunately, for both Swift and Kotlin, the convention is `camelCase` for methods and `PascalCase` for classes/interfaces.
+- [Rust](/core-crypto/main/rust/core_crypto/)
+
+These docs are most useful for Core-Crypto developers working internally, but may be useful for client developers looking for additional insights on implementation.
+
+## Bindings Docs
+
+- [Typescript](/core-crypto/main/typescript)
+- [Kotlin](/core-crypto/main/kotlin)
+- [Swift](/core-crypto/main/swift)
 
 ## Naming conventions table
 
@@ -40,4 +44,3 @@
 | `HashMap<String, T>`    | `Dictionary<String, T>`            | `Map<String, T>`           | `Record<string, T>`                      |
 | `()`                    | `nil`                              | `null`                     | `null`                                   |
 | `Result<T, E>`          | `func placeholder() throws E -> T` | `T placeholder() throws E` | `function placeholder(): T // @throws E` |
-

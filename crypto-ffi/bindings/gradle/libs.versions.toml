@@ -1,23 +1,27 @@
 [versions]
-kotlin = "1.9.0"
+kotlin = "1.9.25"
 app-compat = "1.6.1"
 coroutines = "1.7.3"
-jna = "5.13.0"
+jna = "5.14.0"
 ktx-core = "1.10.1"
 slf4j = "2.0.7"
 assertj = "3.24.2"
 espresso = "3.5.1"
 android-junit = "1.1.5"
 android-logback = "2.0.0"
-android-tools = "8.0.0"
-sdk-compile = "33"
+android-tools = "8.7.0"
+sdk-compile = "34"
 sdk-min = "26"
-gradle = "8.2.1"
-vanniktech-publish = "0.25.3"
-kotlin-gradle = "1.9.0"
+gradle = "8.8"
+vanniktech-publish = "0.30.0"
+kotlin-gradle = "1.9.21"
+dokka = "2.0.0"
+detekt = "1.23.8"
 
 [plugins]
 vanniktech-publish = { id = "com.vanniktech.maven.publish", version.ref = "vanniktech-publish" }
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
+detekt = { id = "io.gitlab.arturbosch.detekt", version.ref = "detekt" }
 
 [libraries]
 kotlin-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }

@@ -1,25 +1,9 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
 pub use rstest::*;
 pub use rstest_reuse::{self, *};
 
 mod common;
 
-pub mod tests {
+mod tests {
     use crate::common::*;
     use openmls::prelude::TlsDeserializeTrait;
     use openmls::{credentials::Credential, prelude::Ciphersuite};
@@ -30,11 +14,11 @@ pub mod tests {
 
     use mls_crypto_provider::MlsCryptoProvider;
 
+    use core_crypto_keystore::MissingKeyErrorKind;
     use core_crypto_keystore::entities::{
         EntityBase, MlsCredential, MlsHpkePrivateKey, MlsKeyPackage, MlsPskBundle, MlsSignatureKeyPair,
         PersistedMlsGroup, PersistedMlsPendingGroup,
     };
-    use core_crypto_keystore::{Connection, MissingKeyErrorKind};
     use openmls::prelude::TlsSerializeTrait as _;
     use openmls_traits::OpenMlsCryptoProvider as _;
 
@@ -48,12 +32,12 @@ pub mod tests {
 
         assert_eq!(
             MlsKeyPackage::to_missing_key_err_kind(),
-            MissingKeyErrorKind::MlsKeyPackageBundle
+            MissingKeyErrorKind::MlsKeyPackage
         );
 
         assert_eq!(
             PersistedMlsGroup::to_missing_key_err_kind(),
-            MissingKeyErrorKind::MlsGroup
+            MissingKeyErrorKind::PersistedMlsGroup
         );
 
         assert_eq!(
@@ -79,13 +63,14 @@ pub mod tests {
 
     #[apply(all_storage_types)]
     #[wasm_bindgen_test]
-    pub async fn can_add_read_delete_credential_bundle_openmls_traits(store: Connection) {
+    pub async fn can_add_read_delete_credential_bundle_openmls_traits(context: KeystoreTestContext) {
+        use core_crypto_keystore::connection::FetchFromDatabase;
         use openmls_basic_credential::SignatureKeyPair;
 
-        let store = store.await;
+        let store = context.store();
         let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
-        let backend = MlsCryptoProvider::new_with_store(store, None);
+        let backend = MlsCryptoProvider::new_with_store(store.clone(), None);
         let identity_id: [u8; 16] = rand::random();
         let identity_id = uuid::Uuid::from_bytes(identity_id);
 
@@ -138,11 +123,9 @@ pub mod tests {
             .remove::<MlsSignatureKeyPair, _>(keypair.public())
             .await
             .unwrap();
-
-        teardown(backend.unwrap_keystore()).await;
     }
 
-    // FIXME: rewrite the tests using the new OpenMLS apis
+    // FIXME: rewrite the tests using the new OpenMLS apis. Tracking issue: WPB-9657
     // #[apply(all_storage_types)]
     // #[wasm_bindgen_test]
     // pub async fn can_add_read_delete_keypackage_bundle_openmls_traits(store: Connection) {

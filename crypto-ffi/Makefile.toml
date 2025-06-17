@@ -1,23 +1,6 @@
 [env]
 ANDROID_NDK_PREFER_VERSION = "25.2"
-LIBRARY_EXTENSION = { source = "${CARGO_MAKE_RUST_TARGET_OS}", default_value = "so", mapping = { "linux" = "so", "macos" = "dylib", "windows" = "dll", "openbsd" = "so" } }
-
-[tasks.clean]
-command = "cargo"
-args = ["clean"]
-
-[tasks.test]
-command = "cargo"
-args = ["test"]
-dependencies = ["clean"]
-
-[tasks.check]
-command = "cargo"
-args = ["check"]
-
-[tasks.release-build]
-command = "cargo"
-args = ["build", "--release"]
+LIBRARY_EXTENSION = { source = "${CARGO_MAKE_RUST_TARGET_OS}", mapping = { "linux" = "so", "macos" = "dylib" } }
 
 ##################################### DOCS ####################################
 
@@ -25,168 +8,124 @@ args = ["build", "--release"]
 command = "cargo"
 args = ["doc", "--no-deps"]
 
-[tasks.docs-kotlin-install-deps]
-env = { "DOKKA_VERSION" = "1.7.20" }
-script_runner = "@duckscript"
-script = '''
-    println -c bright_blue "Installing Dokka..."
-
-    target_folder = set ../target/_kotlin_docs_tmp/
-    dokka_version_file = set "${target_folder}.DOKKA_VERSION"
-    exists = mkdir ${target_folder}
-    dokka_version_file_exists = is_path_exists ${dokka_version_file}
-    if ${exists} and ${dokka_version_file_exists}
-        current_version = readfile ${dokka_version_file}
-        if eq ${current_version} ${DOKKA_VERSION}
-            println -c bright_blue "Dokka ${DOKKA_VERSION} already present, exiting"
-            exit
-        end
-        println -c bright_blue "Dokka older version detected, reinstalling"
-    end
-
-    println -c bright_blue "Downloading Dokka CLI & dependencies..."
-
-    wget -O "${target_folder}dokka-cli-${DOKKA_VERSION}.jar" "https://repo1.maven.org/maven2/org/jetbrains/dokka/dokka-cli/${DOKKA_VERSION}/dokka-cli-${DOKKA_VERSION}.jar"
-    wget -O "${target_folder}dokka-base-${DOKKA_VERSION}.jar" "https://repo1.maven.org/maven2/org/jetbrains/dokka/dokka-base/${DOKKA_VERSION}/dokka-base-${DOKKA_VERSION}.jar"
-    wget -O "${target_folder}dokka-analysis-${DOKKA_VERSION}.jar" "https://repo1.maven.org/maven2/org/jetbrains/dokka/dokka-analysis/${DOKKA_VERSION}/dokka-analysis-${DOKKA_VERSION}.jar"
-    wget -O "${target_folder}dokka-analysis-compiler-${DOKKA_VERSION}.jar" "https://repo1.maven.org/maven2/org/jetbrains/dokka/kotlin-analysis-compiler/${DOKKA_VERSION}/kotlin-analysis-compiler-${DOKKA_VERSION}.jar"
-    wget -O "${target_folder}dokka-analysis-intellij-${DOKKA_VERSION}.jar" "https://repo1.maven.org/maven2/org/jetbrains/dokka/kotlin-analysis-intellij/${DOKKA_VERSION}/kotlin-analysis-intellij-${DOKKA_VERSION}.jar"
-    # Change those in case the dep jars change when DOKKA_VERSION changes
-    wget -O "${target_folder}kotlinx-coroutines-core-1.6.4.jar" "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core/1.6.4/kotlinx-coroutines-core-1.6.4.jar"
-    wget -O "${target_folder}kotlinx-html-jvm-0.8.1.jar" "https://maven.pkg.jetbrains.space/public/p/kotlinx-html/maven/org/jetbrains/kotlinx/kotlinx-html-jvm/0.8.1/kotlinx-html-jvm-0.8.1.jar"
-    wget -O "${target_folder}freemarker-2.3.31.jar" "https://repo1.maven.org/maven2/org/freemarker/freemarker/2.3.31/freemarker-2.3.31.jar"
-
-    # Touch version so that we can check it in later builds
-    writefile ${dokka_version_file} "${DOKKA_VERSION}"
-    println -c bright_blue "Downloading Dokka CLI & dependencies...done. [.DOKKA_VERSION file = ${DOKKA_VERSION}]"
-'''
-
 [tasks.docs-kotlin]
-dependencies = ["docs-kotlin-install-deps"]
-command = "java"
-args = [
-    "-jar", "../target/_kotlin_docs_tmp/dokka-cli-${DOKKA_VERSION}.jar",
-    "-moduleName", "CoreCrypto",
-    "-pluginsClasspath",
-    "../target/_kotlin_docs_tmp/dokka-base-${DOKKA_VERSION}.jar;../target/_kotlin_docs_tmp/dokka-analysis-${DOKKA_VERSION}.jar;../target/_kotlin_docs_tmp/dokka-analysis-intellij-${DOKKA_VERSION}.jar;../target/_kotlin_docs_tmp/dokka-analysis-compiler-${DOKKA_VERSION}.jar;../target/_kotlin_docs_tmp/kotlinx-coroutines-core-1.6.4.jar;../target/_kotlin_docs_tmp/kotlinx-html-jvm-0.8.1.jar;../target/_kotlin_docs_tmp/freemarker-2.3.31.jar",
-    "-sourceSet", "-src ./bindings/jvm/src/main/kotlin",
-    "-outputDir", "../target/doc/core_crypto_ffi/bindings/kotlin",
+dependencies = [
+    { name = "jvm-darwin", condition = { platforms = ["mac"] } },
+    { name = "jvm-linux", condition = { platforms = ["linux"] } }
 ]
+script = '''
+  cd bindings
+  ./gradlew android:dokkaHtml
+  cd -
+  mkdir -p ../target/kotlin/doc
+  cp -R bindings/android/build/dokka/html/ ../target/kotlin/doc
+'''
 
 [tasks.docs-rust-wasm]
 command = "cargo"
 args = ["doc", "--no-deps", "--target=wasm32-unknown-unknown"]
 
-[tasks.npm-deps]
-command = "npm"
-args = ["install"]
+[tasks.bun-deps]
+command = "bun"
+args = ["install", "--frozen-lockfile", "--cwd", "bindings/js"]
 
 [tasks.docs-ts]
-dependencies = ["npm-deps"]
-command = "npx"
+dependencies = ["wasm", "bun-deps"]
+command = "bun"
 args = [
-    "-y", "typedoc",
+    "x",
+    "typedoc",
     "--basePath", "./bindings/js",
-    "--entryPoints", "./bindings/js/CoreCrypto.ts",
+    "--entryPoints", "./bindings/js/src/CoreCrypto.ts",
     "--tsconfig", "./bindings/js/tsconfig.json",
-    "--out", "../target/doc/core_crypto_ffi/bindings/typescript"
+    "--out", "../target/typescript/doc",
+    "--readme", "none",
+    "--treatWarningsAsErrors",
 ]
-
-#[tasks.docs-swift]
-# TODO:
 
 ##################################### WASM ####################################
 
 [tasks.wasm-build]
 command = "wasm-pack"
-# env = { "WASM_BINDGEN_WEAKREF" = 1, "WASM_BINDGEN_EXTERNREF" = 1 }
 args = [
     "build",
-    "--out-dir", "bindings/js/wasm",
+    "--locked",
+    "--no-pack",
+    "--out-dir", "bindings/js/src",
     "--out-name", "core-crypto-ffi",
     "--mode", "normal",
     "--target", "web",
     "${@}"
 ]
 
-# Quiets warning related to wasm-opt. Used to generate bindings and check Typescript wrapper
-[tasks.wasm-build-dev]
-script = "cargo make wasm-build --dev"
-
 [tasks.wasm]
-dependencies = ["wasm-build"]
+dependencies = ["wasm-build", "bun-deps"]
 command = "bun"
-args = ["run", "build_ts.ts"]
+args = ["run", "--cwd", "bindings/js", "build"]
 
 ##################################### FFI #####################################
 
-[tasks.compile-ffi-swift]
-dependencies = ["release-build"]
+[tasks.bindings-swift]
 command = "cargo"
 args = [
     "run",
+    "--locked",
+    "--release",
     "--features", "uniffi/cli",
     "--bin", "uniffi-bindgen",
     "generate",
     "--language", "swift",
-    "--out-dir", "./bindings/swift/WireCoreCrypto/WireCoreCrypto",
-    "--library", "../target/release/libcore_crypto_ffi.${LIBRARY_EXTENSION}"
+    "--out-dir", "./bindings/swift/WireCoreCryptoUniffi/WireCoreCryptoUniffi",
+    "--library", "../target/release/deps/libcore_crypto_ffi.${LIBRARY_EXTENSION}"
 ]
 
-[tasks.ffi-swift]
-dependencies = ["compile-ffi-swift"]
-script = '''
-    mv ./bindings/swift/WireCoreCrypto/WireCoreCrypto/core_crypto_ffi.swift ./bindings/swift/WireCoreCrypto/WireCoreCrypto/CoreCrypto.swift
-'''
-
-
-[tasks.compile-ffi-kotlin]
-dependencies = ["release-build"]
+[tasks.bindings-kotlin-android]
 command = "cargo"
 args = [
     "run",
+    "--locked",
+    "--release",
+    "--features", "uniffi/cli",
+    "--bin", "uniffi-bindgen",
+    "generate",
+    "--config", "uniffi-android.toml",
+    "--language", "kotlin",
+    "--no-format",
+    "--out-dir", "./bindings/uniffi-android/src/main/kotlin/",
+    "--library", "../target/release/deps/libcore_crypto_ffi.${LIBRARY_EXTENSION}"
+]
+
+[tasks.bindings-kotlin-jvm]
+command = "cargo"
+args = [
+    "run",
+    "--locked",
+    "--release",
     "--features", "uniffi/cli",
     "--bin", "uniffi-bindgen",
     "generate",
     "--language", "kotlin",
-    "--out-dir", "./bindings/jvm/src/main/kotlin/",
-    "--library", "../target/release/libcore_crypto_ffi.${LIBRARY_EXTENSION}"
+    "--no-format",
+    "--out-dir", "./bindings/uniffi-jvm/src/main/kotlin/",
+    "--library", "../target/release/deps/libcore_crypto_ffi.${LIBRARY_EXTENSION}"
 ]
 
-[tasks.ffi-kotlin]
-dependencies = ["compile-ffi-kotlin"]
-script = '''
-    mv ./bindings/jvm/src/main/kotlin/com/wire/crypto/core_crypto_ffi.kt ./bindings/jvm/src/main/kotlin/com/wire/crypto/CoreCrypto.kt
+[tasks.bindings-kotlin]
+dependencies = ["bindings-kotlin-android", "bindings-kotlin-jvm"]
 
-    sed -i.bak \
-        -e 's/\CryptoException\b/CryptoError/g' \
-        -e 's/\bE2eIdentityException\b/E2eIdentityError/g' \
-        ./bindings/jvm/src/main/kotlin/uniffi/core_crypto/core_crypto.kt
-
-    rm ./bindings/jvm/src/main/kotlin/uniffi/core_crypto/core_crypto.kt.bak
-'''
-
-[tasks.ffi]
-dependencies = ["ffi-swift", "ffi-kotlin"]
+[tasks.bindings]
+dependencies = ["bindings-swift", "bindings-kotlin"]
 
 ##################################### iOS #####################################
-
-[tasks.ios-env]
-plugin = "detect-release"
-
 [tasks.ios-device]
-dependencies = ["ffi-swift"]
-condition = { platforms = ["mac"] }
-command = "cargo"
-args = ["rustc", "--target", "aarch64-apple-ios", "--crate-type=cdylib", "--crate-type=staticlib", "--release", "--", "-C", "strip=symbols"]
-
-[tasks.ios-simulator-x86]
-dependencies = ["ffi-swift"]
+dependencies = ["bindings-swift"]
+env = { "IPHONEOS_DEPLOYMENT_TARGET"="16.0" }
 condition = { platforms = ["mac"] }
 command = "cargo"
 args = [
     "rustc",
-    "--target", "x86_64-apple-ios",
+    "--locked",
+    "--target", "aarch64-apple-ios",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
     "--release",
@@ -195,13 +134,14 @@ args = [
 ]
 
 [tasks.ios-simulator-arm]
-dependencies = ["ffi-swift"]
+dependencies = ["bindings-swift"]
 # override CFLAGS to fix ring compilation
 env = { "CRATE_CC_NO_DEFAULTS" = 1, "TARGET_CFLAGS" = { script = ["echo \"--target=arm64-apple-ios14.0.0-simulator -mios-simulator-version-min=14.0 -isysroot `xcrun --show-sdk-path --sdk iphonesimulator`\""] } }
 condition = { platforms = ["mac"] }
 command = "cargo"
 args = [
     "rustc",
+    "--locked",
     "--target", "aarch64-apple-ios-sim",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
@@ -212,7 +152,7 @@ args = [
 
 [tasks.ios]
 condition = { platforms = ["mac"] }
-dependencies = ["ios-device", "ios-simulator-x86", "ios-simulator-arm"]
+dependencies = ["ios-device", "ios-simulator-arm"]
 
 [tasks.ios-create-xcframework]
 condition = { platforms = ["mac"] }
@@ -232,6 +172,7 @@ plugin = "android-env"
 command = "cargo"
 args = [
     "rustc",
+    "--locked",
     "--target", "armv7-linux-androideabi",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
@@ -239,12 +180,13 @@ args = [
     "--",
     "-C", "strip=symbols"
 ]
-dependencies = ["ffi-kotlin", "android-env"]
+dependencies = ["android-env"]
 
 [tasks.android-armv8]
 command = "cargo"
 args = [
     "rustc",
+    "--locked",
     "--target", "aarch64-linux-android",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
@@ -252,85 +194,34 @@ args = [
     "--",
     "-C", "strip=symbols"
 ]
-dependencies = ["ffi-kotlin", "android-env"]
+dependencies = ["android-env"]
 
 [tasks.android-x86]
 command = "cargo"
 args = [
     "rustc",
+    "--locked",
     "--target", "x86_64-linux-android",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
     "--release",
     "--",
-    "-C", "strip=symbols"
+    "-C", "strip=symbols",
+    "-l", "static=clang_rt.builtins-x86_64-android",
+    "-L", "${CLANG_RT_DIR}"
 ]
-dependencies = ["ffi-kotlin", "android-env"]
-
-[tasks.android-i686]
-command = "cargo"
-args = [
-    "rustc",
-    "--target", "i686-linux-android",
-    "--crate-type=cdylib",
-    "--crate-type=staticlib",
-    "--release",
-    "--",
-    "-C", "strip=symbols"
-]
-dependencies = ["ffi-kotlin", "android-env"]
+dependencies = ["android-env"]
 
 [tasks.android]
-dependencies = ["android-armv7", "android-armv8", "android-x86", "android-i686"]
-
-[tasks.setup-sample-project]
-dependencies = ["android"]
-script_runner = "@duckscript"
-script = '''
-handle = map
-map_put ${handle} "i686-linux-android" "x86"
-map_put ${handle} "x86_64-linux-android" "x86_64"
-map_put ${handle} "aarch64-linux-android" "arm64-v8a"
-map_put ${handle} "armv7-linux-androideabi" "armeabi-v7a"
-keys = map_keys ${handle}
-libname = set "libcore_crypto_ffi.${LIBRARY_EXTENSION}"
-for rust_target in ${keys}
-    android_target = map_get ${handle} ${rust_target}
-    println -c bright_blue "cp rust-${rust_target}/${libname} -> android-jniLibs/${android_target}/${libname}"
-    from = canonicalize "../target/${rust_target}/debug/${libname}"
-    to = canonicalize "../sample-projects/android/CoreCryptoTestApp/app/src/main/jniLibs/${android_target}/${libname}"
-    mkdir dirname ${to}
-    cp ${from} ${to}
-end
-
-release ${handle}
-
-println -c bright_blue "cp ./bindings/jvm/src/main/kotlin/com/wire/crypto/CoreCrypto.kt -> ../sample-projects/android/CoreCryptoTestApp/app/src/main/java/com/wire/core/CoreCrypto.kt"
-from = canonicalize "./bindings/jvm/src/main/kotlin/com/wire/crypto/CoreCrypto.kt"
-to = canonicalize "../sample-projects/android/CoreCryptoTestApp/app/src/main/java/com/wire/crypto/CoreCrypto.kt"
-cp ${from} ${to}
-'''
+dependencies = ["android-armv7", "android-armv8", "android-x86"]
 
 ####################################  JVM  ####################################
 
-[tasks.jvm-x86-darwin]
+[tasks.jvm-darwin]
 command = "cargo"
 args = [
     "rustc",
-    "--target", "x86_64-apple-darwin",
-    "--crate-type=cdylib",
-    "--crate-type=staticlib",
-    "--release",
-    "--",
-    "-C", "strip=symbols"
-]
-dependencies = ["ffi-kotlin"]
-condition = { platforms = ["mac"] }
-
-[tasks.jvm-aarch64-darwin]
-command = "cargo"
-args = [
-    "rustc",
+    "--locked",
     "--target", "aarch64-apple-darwin",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
@@ -338,13 +229,14 @@ args = [
     "--",
     "-C", "strip=symbols"
 ]
-dependencies = ["ffi-kotlin"]
+dependencies = ["bindings-kotlin-jvm"]
 condition = { platforms = ["mac"] }
 
-[tasks.jvm-x86-linux]
+[tasks.jvm-linux]
 command = "cargo"
 args = [
     "rustc",
+    "--locked",
     "--target", "x86_64-unknown-linux-gnu",
     "--crate-type=cdylib",
     "--crate-type=staticlib",
@@ -352,14 +244,8 @@ args = [
     "--",
     "-C", "strip=symbols"
 ]
-dependencies = ["ffi-kotlin"]
+dependencies = ["bindings-kotlin-jvm"]
 condition = { platforms = ["linux"] }
-
-[tasks.jvm-darwin]
-dependencies = ["jvm-aarch64-darwin", "jvm-x86-darwin"]
-
-[tasks.jvm-linux]
-dependencies = ["jvm-x86-linux"]
 
 [tasks.jvm]
 dependencies = ["jvm-darwin", "jvm-linux"]
@@ -373,37 +259,14 @@ dependencies = ["android", "ios"]
 dependencies = ["mobile", "wasm"]
 
 ################################### Plugins ###################################
-[plugins.impl.detect-release]
-script = '''
-index = array_contains ${task.args} "--release"
-if index
-    set_env IS_RELEASE_BUILD "release"
-    println -c bright_blue "Release mode detected!"
-end
-
-release_path = set IS_RELEASE_BUILD or "debug"
-
-# index_target = array_contains ${task.args} "--target"
-# if index_target
-#     target = array_get ${task.args} ${${index_target} + 1}
-#     set_env CORECRYPTO_TARGET_FOLDER "../target/${target}/${release_path}"
-# else
-#     set_env CORECRYPTO_TARGET_FOLDER "../target/${release_path}"
-# end
-'''
-
 [plugins.impl.android-env]
 script = '''
 exit_on_error true
 
 fn update_android_env
     platform = os_family
-    if eq ${platform} "windows"
-        platform_dir = set "windows-x86_64"
-    elseif eq ${platform} "linux"
+    if eq ${platform} "linux"
         platform_dir = set "linux-x86_64"
-    elseif eq ${platform} "mac"
-        platform_dir = set "darwin-x86_64"
     else
         trigger_error "Unsupported host platform"
     end
@@ -417,10 +280,17 @@ fn update_android_env
     set_env ANDROID_NDK_HOME "${base_ndk_path}"
     set_env NDK_HOME "${base_ndk_path}"
 
+    # Determine the clang runtime lib dir so we can statically link
+    # clang_rt.builtins-x86_64-android on x86_64 Android.
+    output = exec ${base_ndk_path}/bin/clang --print-runtime-dir
+    clang_rt_dir = trim_end ${output.stdout}
+    clang_rt_dir = dirname ${clang_rt_dir}
+    clang_rt_dir = join_path ${clang_rt_dir} linux
+    set_env CLANG_RT_DIR "${clang_rt_dir}"
+
     set_env CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_ANDROID_NDK "${base_ndk_path}"
     set_env CARGO_TARGET_AARCH64_LINUX_ANDROID_ANDROID_NDK "${base_ndk_path}"
     set_env CARGO_TARGET_X86_64_LINUX_ANDROID_ANDROID_NDK "${base_ndk_path}"
-    set_env CARGO_TARGET_I686_LINUX_ANDROID_ANDROID_NDK "${base_ndk_path}"
 end
 
 fn autodetect_android_env
@@ -432,10 +302,7 @@ fn autodetect_android_env
         platform = os_family
         sdk_folder = set "Sdk"
 
-        if eq ${platform} "windows"
-            platform_dir = get_home_dir
-            platform_dir = set "${platform_dir}/AppData/Local"
-        elseif eq ${platform} "linux"
+        if eq ${platform} "linux"
             platform_dir = get_home_dir
         elseif eq ${platform} "mac"
             platform_dir = get_home_dir

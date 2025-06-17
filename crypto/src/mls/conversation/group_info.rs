@@ -1,7 +1,7 @@
-use openmls::prelude::{group_info::GroupInfo, MlsMessageOut};
+use openmls::prelude::{MlsMessageOut, group_info::GroupInfo};
 use serde::{Deserialize, Serialize};
 
-use crate::{CryptoResult, MlsError};
+use super::{Error, Result};
 
 /// A [GroupInfo] with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,11 +16,13 @@ pub struct MlsGroupInfoBundle {
 
 impl MlsGroupInfoBundle {
     /// Creates a new [GroupInfoBundle] with complete and unencrypted [GroupInfo]
-    pub(crate) fn try_new_full_plaintext(gi: GroupInfo) -> CryptoResult<Self> {
+    pub(crate) fn try_new_full_plaintext(gi: GroupInfo) -> Result<Self> {
         use tls_codec::Serialize as _;
 
         let payload = MlsMessageOut::from(gi);
-        let payload = payload.tls_serialize_detached().map_err(MlsError::from)?;
+        let payload = payload
+            .tls_serialize_detached()
+            .map_err(Error::tls_serialize("unencrypted mls message"))?;
         Ok(Self {
             encryption_type: MlsGroupInfoEncryptionType::Plaintext,
             ratchet_tree_type: MlsRatchetTreeType::Full,
@@ -31,6 +33,9 @@ impl MlsGroupInfoBundle {
 
 #[cfg(test)]
 impl MlsGroupInfoBundle {
+    // test functions are not held to the same standard
+    #![allow(missing_docs)]
+
     pub fn get_group_info(self) -> openmls::prelude::group_info::VerifiableGroupInfo {
         match self.get_payload().extract() {
             openmls::prelude::MlsMessageInBody::GroupInfo(vgi) => vgi,
@@ -89,7 +94,7 @@ pub enum MlsRatchetTreeType {
     /// Contains [GroupInfo] changes since previous epoch (not yet implemented)
     /// (see [draft](https://github.com/rohan-wire/ietf-drafts/blob/main/mahy-mls-ratchet-tree-delta/draft-mahy-mls-ratchet-tree-delta.md))
     Delta = 2,
-    /// TODO: to define
+    /// Not implemented
     ByRef = 3,
 }
 
@@ -98,7 +103,7 @@ pub enum MlsRatchetTreeType {
 pub enum GroupInfoPayload {
     /// Unencrypted [GroupInfo]
     Plaintext(Vec<u8>),
-    // TODO: expose when fully implemented
+    // not implemented
     // Encrypted(Vec<u8>),
 }
 

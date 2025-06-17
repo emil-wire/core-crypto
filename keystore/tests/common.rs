@@ -1,27 +1,14 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
 #![allow(dead_code, unused_macros, unused_imports)]
 
-pub use core_crypto_keystore::Connection as CryptoKeystore;
+pub(crate) use core_crypto_keystore::{Connection as CryptoKeystore, DatabaseKey};
+use std::array;
+use std::sync::{Arc, LazyLock};
 
-pub use rstest::*;
-pub use rstest_reuse::{self, *};
+use core_crypto_keystore::connection::{DatabaseConnection, KeystoreDatabaseConnection};
+pub(crate) use rstest::*;
+pub(crate) use rstest_reuse::{self, *};
 
-pub const TEST_ENCRYPTION_KEY: &str = "test1234";
+pub(crate) static TEST_ENCRYPTION_KEY: LazyLock<DatabaseKey> = LazyLock::new(DatabaseKey::generate);
 
 #[fixture]
 pub fn store_name() -> String {
@@ -40,27 +27,44 @@ pub fn store_name() -> String {
 }
 
 #[fixture(name = store_name(), in_memory = false)]
-pub async fn setup(name: impl AsRef<str>, in_memory: bool) -> core_crypto_keystore::Connection {
-    if !in_memory {
-        core_crypto_keystore::Connection::open_with_key(name, TEST_ENCRYPTION_KEY).await
+pub async fn setup(name: impl AsRef<str>, in_memory: bool) -> KeystoreTestContext {
+    let store = if !in_memory {
+        core_crypto_keystore::Connection::open_with_key(name, &TEST_ENCRYPTION_KEY).await
     } else {
-        core_crypto_keystore::Connection::open_in_memory_with_key(name, TEST_ENCRYPTION_KEY).await
+        core_crypto_keystore::Connection::open_in_memory_with_key(name, &TEST_ENCRYPTION_KEY).await
     }
-    .unwrap()
+    .expect("Could not open keystore");
+    store.new_transaction().await.expect("Could not create transaction");
+    KeystoreTestContext { store: Some(store) }
+}
+
+pub struct KeystoreTestContext {
+    store: Option<core_crypto_keystore::Connection>,
+}
+
+impl KeystoreTestContext {
+    pub fn store(&self) -> &core_crypto_keystore::Connection {
+        self.store.as_ref().expect("KeystoreTestFixture store is missing")
+    }
+
+    pub fn store_mut(&mut self) -> &mut core_crypto_keystore::Connection {
+        self.store.as_mut().expect("KeystoreTestFixture store is missing")
+    }
+}
+
+impl Drop for KeystoreTestContext {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            async_std::task::block_on(async {
+                store.commit_transaction().await.expect("Could not commit transaction");
+                store.wipe().await.expect("Could not wipe store");
+            });
+        }
+    }
 }
 
 #[template]
 #[rstest]
-#[case::persistent(setup(store_name(), false))]
-#[case::in_memory(setup(store_name(), true))]
-pub async fn all_storage_types(
-    #[case]
-    #[future]
-    store: core_crypto_keystore::Connection,
-) {
-}
-
-#[inline(always)]
-pub async fn teardown(store: core_crypto_keystore::Connection) {
-    store.wipe().await.unwrap();
-}
+#[case::persistent(setup(store_name(), false).await)]
+#[case::in_memory(setup(store_name(), true).await)]
+pub async fn all_storage_types(#[case] context: KeystoreTestContext) {}

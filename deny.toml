@@ -1,16 +1,15 @@
+[graph]
 targets = [
     # Desktop
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "aarch64-unknown-linux-gnu" },
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "aarch64-apple-darwin" },
-    { triple = "x86_64-apple-darwin" },
     { triple = "x86_64-pc-windows-msvc" },
     # WASM
     { triple = "wasm32-unknown-unknown" },
     # iOS
     { triple = "aarch64-apple-ios-sim" },
-    { triple = "x86_64-apple-ios" },
     { triple = "aarch64-apple-ios" },
     # Android
     { triple = "aarch64-linux-android" },
@@ -19,60 +18,30 @@ targets = [
 ]
 
 [advisories]
-vulnerability = "deny"
+version = 2
 ignore = [
-    # ? ansi_term works well as is, despite being unmaintained
-    "RUSTSEC-2021-0139",
-    # ? `time` is only used in the interop runner
-    "RUSTSEC-2020-0071",
-    # ? `sodiumoxide` is only used in tests
+    # `sodiumoxide` is only used in tests
     "RUSTSEC-2021-0137",
-    # ? `atty` only has a vuln on windows
-    "RUSTSEC-2021-0145",
+    # `paste` is no longer maintained and its repo is archived,
+    # however `uniffi` still depends on it.
+    "RUSTSEC-2024-0436"
 ]
 
 [bans]
 multiple-versions = "allow"
 
 [licenses]
-unlicensed = "deny"
-allow-osi-fsf-free = "both"
-copyleft = "allow"
-unused-allowed-license = "warn"
-confidence-threshold = 0.93
-allow = ["Apache-2.0", "MIT", "MPL-2.0", "GPL-3.0", "OpenSSL"]
-exceptions = [{ allow = ["Unicode-DFS-2016"], name = "unicode-ident" }]
-
-[[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 }
+version = 2
+allow = ["Apache-2.0", "MIT", "MPL-2.0", "GPL-3.0", "CC0-1.0", "BSD-3-Clause",
+         "Apache-2.0 WITH LLVM-exception", "ISC", "Zlib", "Unicode-3.0"]
+exceptions = [
+    { allow = ["Unicode-DFS-2016"], name = "unicode-ident" },
 ]
 
 [[licenses.clarify]]
-name = "encoding_rs"
-expression = "MIT OR Apache-2.0"
-license-files = [
-    { path = "COPYRIGHT", hash = 0x39f8ad31 }
-]
-
-[[licenses.clarify]]
-name = "webpki"
-expression = "ISC"
-license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
-
-[sources]
-allow-git = [
-    # ? Needed fork for PQ crypto
-    "https://github.com/bwesterb/argyle-kyber",
-    # ? Needed for our interop runner.
-    # "https://github.com/otak/fantoccini",
-    # ? Needed for rusqlite
-    "https://github.com/alexcrichton/openssl-src-rs",
-    # ? Used in a devdep within wiree2eidentity
-    "https://github.com/briansmith/ring",
-]
+name = "pkiprocmacros"
+expression = "Apache-2.0 OR MIT"
+license-files = []
 
 [sources.allow-org]
 github = ["wireapp"]

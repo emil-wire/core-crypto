@@ -1,21 +1,7 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
+use std::sync::Arc;
 
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
-use crate::prelude::{CryptoResult, MlsConversation};
-use core_crypto_keystore::entities::EntityFindParams;
+use crate::{KeystoreError, RecursiveError, Result, prelude::MlsConversation};
+use core_crypto_keystore::connection::FetchFromDatabase;
 
 #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
@@ -23,19 +9,11 @@ pub(crate) trait GroupStoreEntity: std::fmt::Debug {
     type RawStoreValue: core_crypto_keystore::entities::Entity;
     type IdentityType;
 
-    fn id(&self) -> &[u8];
-
     async fn fetch_from_id(
         id: &[u8],
         identity: Option<Self::IdentityType>,
-        keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> CryptoResult<Option<Self>>
-    where
-        Self: Sized;
-
-    async fn fetch_all(
-        keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> CryptoResult<Vec<Self>>
+        keystore: &impl FetchFromDatabase,
+    ) -> Result<Option<Self>>
     where
         Self: Sized;
 }
@@ -46,91 +24,27 @@ impl GroupStoreEntity for MlsConversation {
     type RawStoreValue = core_crypto_keystore::entities::PersistedMlsGroup;
     type IdentityType = ();
 
-    fn id(&self) -> &[u8] {
-        self.id().as_slice()
-    }
-
     async fn fetch_from_id(
         id: &[u8],
         _: Option<Self::IdentityType>,
-        keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> crate::CryptoResult<Option<Self>> {
-        use core_crypto_keystore::entities::EntityBase as _;
-        let Some(store_value) = Self::RawStoreValue::find_one(keystore, &id.into()).await? else {
+        keystore: &impl FetchFromDatabase,
+    ) -> crate::Result<Option<Self>> {
+        let result = keystore
+            .find::<Self::RawStoreValue>(id)
+            .await
+            .map_err(KeystoreError::wrap("finding mls conversation from keystore by id"))?;
+        let Some(store_value) = result else {
             return Ok(None);
         };
 
-        let conversation = Self::from_serialized_state(store_value.state.clone(), store_value.parent_id.clone())?;
+        let conversation = Self::from_serialized_state(store_value.state.clone(), store_value.parent_id.clone())
+            .map_err(RecursiveError::mls_conversation("deserializing mls conversation"))?;
         // If the conversation is not active, pretend it doesn't exist
-        Ok(if conversation.group.is_active() {
-            Some(conversation)
-        } else {
-            None
-        })
-    }
-
-    async fn fetch_all(
-        keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> CryptoResult<Vec<Self>> {
-        use core_crypto_keystore::entities::EntityBase as _;
-
-        let all_conversations = Self::RawStoreValue::find_all(keystore, EntityFindParams::default());
-        Ok(all_conversations
-            .await?
-            .iter()
-            .filter_map(|c| {
-                let conversation = Self::from_serialized_state(c.state.clone(), c.parent_id.clone()).unwrap();
-                conversation.group.is_active().then_some(conversation)
-            })
-            .collect::<Vec<_>>())
+        Ok(conversation.group.is_active().then_some(conversation))
     }
 }
 
-#[cfg(feature = "proteus")]
-#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
-impl GroupStoreEntity for crate::proteus::ProteusConversationSession {
-    type RawStoreValue = core_crypto_keystore::entities::ProteusSession;
-    type IdentityType = std::sync::Arc<proteus_wasm::keys::IdentityKeyPair>;
-
-    fn id(&self) -> &[u8] {
-        unreachable!()
-    }
-
-    async fn fetch_from_id(
-        id: &[u8],
-        identity: Option<Self::IdentityType>,
-        keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> crate::CryptoResult<Option<Self>> {
-        use core_crypto_keystore::entities::EntityBase as _;
-        let Some(store_value) = Self::RawStoreValue::find_one(keystore, &id.into()).await? else {
-            return Ok(None);
-        };
-
-        let Some(identity) = identity else {
-            return Err(crate::CryptoError::ProteusNotInitialized);
-        };
-
-        let session = proteus_wasm::session::Session::deserialise(identity, &store_value.session)
-            .map_err(crate::ProteusError::from)?;
-
-        Ok(Some(Self {
-            identifier: store_value.id.clone(),
-            session,
-        }))
-    }
-
-    async fn fetch_all(
-        _keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-    ) -> CryptoResult<Vec<Self>>
-    where
-        Self: Sized,
-    {
-        unreachable!()
-    }
-}
-
-pub(crate) type GroupStoreValue<V> = std::sync::Arc<async_lock::RwLock<V>>;
+pub(crate) type GroupStoreValue<V> = Arc<async_lock::RwLock<V>>;
 
 pub(crate) type LruMap<V> = schnellru::LruMap<Vec<u8>, GroupStoreValue<V>, HybridMemoryLimiter>;
 
@@ -180,73 +94,53 @@ impl<V: GroupStoreEntity> std::ops::DerefMut for GroupStore<V> {
 }
 
 impl<V: GroupStoreEntity> GroupStore<V> {
-    #[allow(dead_code)]
     pub(crate) fn new_with_limit(len: u32) -> Self {
         let limiter = HybridMemoryLimiter::new(Some(len), None);
         let store = schnellru::LruMap::new(limiter);
         Self(store)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn new(count: Option<u32>, memory: Option<usize>) -> Self {
+    #[cfg(test)]
+    fn new(count: Option<u32>, memory: Option<usize>) -> Self {
         let limiter = HybridMemoryLimiter::new(count, memory);
         let store = schnellru::LruMap::new(limiter);
         Self(store)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn contains_key(&self, k: &[u8]) -> bool {
+    #[cfg(test)]
+    fn contains_key(&self, k: &[u8]) -> bool {
         self.0.peek(k).is_some()
     }
 
     pub(crate) async fn get_fetch(
         &mut self,
         k: &[u8],
-        keystore: &mut core_crypto_keystore::Connection,
+        keystore: &impl FetchFromDatabase,
         identity: Option<V::IdentityType>,
-    ) -> crate::CryptoResult<Option<GroupStoreValue<V>>> {
+    ) -> crate::Result<Option<GroupStoreValue<V>>> {
         // Optimistic cache lookup
         if let Some(value) = self.0.get(k) {
             return Ok(Some(value.clone()));
         }
 
-        let mut keystore_connection = keystore
-            .borrow_conn()
-            .await
-            .map_err(|_| crate::CryptoError::LockPoisonError)?;
-
         // Not in store, fetch the thing in the keystore
-        let mut value = V::fetch_from_id(k, identity, &mut keystore_connection).await?;
-        if let Some(value) = value.take() {
-            let value_to_insert = std::sync::Arc::new(async_lock::RwLock::new(value));
+        let inserted_value = V::fetch_from_id(k, identity, keystore).await?.map(|value| {
+            let value_to_insert = Arc::new(async_lock::RwLock::new(value));
             self.insert_prepped(k.to_vec(), value_to_insert.clone());
-
-            Ok(Some(value_to_insert))
-        } else {
-            Ok(None)
-        }
+            value_to_insert
+        });
+        Ok(inserted_value)
     }
 
-    pub(crate) async fn get_fetch_all(
-        &mut self,
-        keystore: &mut core_crypto_keystore::Connection,
-    ) -> CryptoResult<Vec<GroupStoreValue<V>>> {
-        let mut keystore_connection = keystore
-            .borrow_conn()
-            .await
-            .map_err(|_| crate::CryptoError::LockPoisonError)?;
-
-        let all = V::fetch_all(&mut keystore_connection)
-            .await?
-            .into_iter()
-            .map(|g| {
-                let id = g.id().to_vec();
-                let to_insert = std::sync::Arc::new(async_lock::RwLock::new(g));
-                self.insert_prepped(id, to_insert.clone());
-                to_insert
-            })
-            .collect::<Vec<_>>();
-        Ok(all)
+    /// Returns the value from the keystore.
+    /// WARNING: the returned value is not attached to the keystore and mutations on it will be
+    /// lost when the object is dropped
+    pub(crate) async fn fetch_from_keystore(
+        k: &[u8],
+        keystore: &impl FetchFromDatabase,
+        identity: Option<V::IdentityType>,
+    ) -> crate::Result<Option<V>> {
+        V::fetch_from_id(k, identity, keystore).await
     }
 
     fn insert_prepped(&mut self, k: Vec<u8>, prepped_entity: GroupStoreValue<V>) {
@@ -254,18 +148,18 @@ impl<V: GroupStoreEntity> GroupStore<V> {
     }
 
     pub(crate) fn insert(&mut self, k: Vec<u8>, entity: V) {
-        let value_to_insert = std::sync::Arc::new(async_lock::RwLock::new(entity));
+        let value_to_insert = Arc::new(async_lock::RwLock::new(entity));
         self.insert_prepped(k, value_to_insert)
     }
 
     pub(crate) fn try_insert(&mut self, k: Vec<u8>, entity: V) -> Result<(), V> {
-        let value_to_insert = std::sync::Arc::new(async_lock::RwLock::new(entity));
+        let value_to_insert = Arc::new(async_lock::RwLock::new(entity));
 
-        if self.0.try_insert(k, value_to_insert.clone()) {
+        if self.0.insert(k, value_to_insert.clone()) {
             Ok(())
         } else {
             // This is safe because we just built the value
-            Err(std::sync::Arc::try_unwrap(value_to_insert).unwrap().into_inner())
+            Err(Arc::into_inner(value_to_insert).unwrap().into_inner())
         }
     }
 
@@ -288,25 +182,8 @@ pub(crate) const ITEM_LIMIT: u32 = 100;
 
 impl HybridMemoryLimiter {
     pub(crate) fn new(count: Option<u32>, memory: Option<usize>) -> Self {
-        // false positive. We want to fetch system metrics lazily
-        #[allow(clippy::unnecessary_lazy_evaluations)]
-        let maybe_memory_limit = memory.or_else(|| {
-            cfg_if::cfg_if! {
-                if #[cfg(target_family = "wasm")] {
-                    None
-                } else {
-                    let system = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::new().with_ram()));
-                    let available_sys_memory = system.available_memory();
-                    if available_sys_memory > 0 {
-                        Some(available_sys_memory as usize)
-                    } else {
-                        None
-                    }
-                }
-            }
-        });
-
-        let mem = schnellru::ByMemoryUsage::new(maybe_memory_limit.unwrap_or(MEMORY_LIMIT));
+        let memory_limit = memory.unwrap_or(MEMORY_LIMIT);
+        let mem = schnellru::ByMemoryUsage::new(memory_limit);
         let len = schnellru::ByLength::new(count.unwrap_or(ITEM_LIMIT));
 
         Self { mem, len }
@@ -353,11 +230,8 @@ impl<K, V> schnellru::Limiter<K, V> for HybridMemoryLimiter {
 #[cfg(test)]
 mod tests {
     use core_crypto_keystore::dummy_entity::{DummyStoreValue, DummyValue};
-    use wasm_bindgen_test::*;
 
     use super::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
 
     #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
@@ -366,30 +240,20 @@ mod tests {
 
         type IdentityType = ();
 
-        fn id(&self) -> &[u8] {
-            unreachable!()
-        }
-
         async fn fetch_from_id(
             id: &[u8],
             _identity: Option<Self::IdentityType>,
-            _keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-        ) -> crate::CryptoResult<Option<Self>> {
-            let id = std::str::from_utf8(id)?;
+            _keystore: &impl FetchFromDatabase,
+        ) -> crate::Result<Option<Self>> {
+            // it's not worth adding a variant to the Error type here to handle test dummy values
+            let id = std::str::from_utf8(id).expect("dummy value ids are strings");
             Ok(Some(id.into()))
-        }
-
-        async fn fetch_all(
-            _keystore: &mut core_crypto_keystore::connection::KeystoreDatabaseConnection,
-        ) -> CryptoResult<Vec<Self>> {
-            unreachable!()
         }
     }
 
     type TestGroupStore = GroupStore<DummyValue>;
 
     #[async_std::test]
-    #[wasm_bindgen_test]
     async fn group_store_init() {
         let store = TestGroupStore::new_with_limit(1);
         assert_eq!(store.len(), 0);
@@ -406,14 +270,15 @@ mod tests {
     }
 
     #[async_std::test]
-    #[wasm_bindgen_test]
     async fn group_store_common_ops() {
         let mut store = TestGroupStore::new(Some(u32::MAX), Some(usize::MAX));
         for i in 1..=3 {
             let i_str = i.to_string();
-            assert!(store
-                .try_insert(i_str.as_bytes().to_vec(), i_str.as_str().into())
-                .is_ok());
+            assert!(
+                store
+                    .try_insert(i_str.as_bytes().to_vec(), i_str.as_str().into())
+                    .is_ok()
+            );
             assert_eq!(store.len(), i);
         }
         for i in 4..=6 {
@@ -428,21 +293,22 @@ mod tests {
     }
 
     #[async_std::test]
-    #[wasm_bindgen_test]
     async fn group_store_operations_len_limiter() {
         let mut store = TestGroupStore::new_with_limit(2);
         assert!(store.try_insert(b"1".to_vec(), "1".into()).is_ok());
         assert_eq!(store.len(), 1);
         assert!(store.try_insert(b"2".to_vec(), "2".into()).is_ok());
         assert_eq!(store.len(), 2);
-        assert!(store.try_insert(b"3".to_vec(), "3".into()).is_err());
+        assert!(store.try_insert(b"3".to_vec(), "3".into()).is_ok());
         assert_eq!(store.len(), 2);
+        assert!(!store.contains_key(b"1"));
+        assert!(store.contains_key(b"2"));
+        assert!(store.contains_key(b"3"));
         store.insert(b"4".to_vec(), "4".into());
         assert_eq!(store.len(), 2);
     }
 
     #[async_std::test]
-    #[wasm_bindgen_test]
     async fn group_store_operations_mem_limiter() {
         use schnellru::{LruMap, UnlimitedCompact};
         let mut lru: LruMap<Vec<u8>, DummyValue, UnlimitedCompact> =

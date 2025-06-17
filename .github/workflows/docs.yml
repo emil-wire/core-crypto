@@ -1,12 +1,15 @@
-name: Publish docs
+name: documentation
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: "${{ github.workflow }}-${{ github.ref }}"
 
 on:
   push:
     branches:
-    - main
+      - main
+    tags:
+      - 'v*'
+  pull_request:
 
 env:
   CARGO_INCREMENTAL: 0
@@ -15,48 +18,133 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
-  docgen:
-    if: github.repository == 'wireapp/core-crypto'
+  rustdoc:
+    name: rust
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
 
-    steps: 
-    - name: Checkout repository
+    steps:
+    - name: checkout repository
       uses: actions/checkout@v4
 
-    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - uses: ./.github/actions/setup-and-cache-rust
+      with:
+        rustflags: '-D warnings -W unreachable-pub'
+    - run: cargo doc --all --no-deps --locked
+
+    - uses: actions/upload-artifact@v4.5.0
+      with:
+        name: rust
+        path: target/doc
+        retention-days: 1
+        overwrite: true
+        include-hidden-files: true
+
+  tsdoc:
+    name: typescript
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: checkout repository
+      uses: actions/checkout@v4
+
+    - uses: ./.github/actions/setup-and-cache-rust
       with:
         rustflags: ''
-        target: wasm32-unknown-unknown
+        target: |
+          wasm32-unknown-unknown
+          x86_64-unknown-linux-gnu
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
-    - name: Setup cargo-make
+    - name: setup cargo-make
       uses: davidB/rust-cargo-make@v1
 
-    - name: Install wasm-pack
-      uses: jetli/wasm-pack-action@v0.4.0
+    - name: install wasm-pack
+      uses: taiki-e/install-action@v2
       with:
-        version: 'latest'
+        tool: wasm-pack
 
-    - name: Build Rust documentation
-      run: cargo doc --all --no-deps
+    - name: setup bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
 
-    - name: Build TypeScript docs
+    - name: make ts docs
       run: |
         cd crypto-ffi
-        cargo make wasm-build
         cargo make docs-ts
+
+    - uses: actions/upload-artifact@v4.5.0
+      with:
+        name: typescript
+        path: target/typescript/doc
+        retention-days: 1
+        overwrite: true
+        include-hidden-files: true
+
+
+  ktdoc:
+    name: kotlin
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: checkout repository
+      uses: actions/checkout@v4
+
+    - uses: ./.github/actions/setup-and-cache-rust
+      with:
+        rustflags: '' # note that this is _not_ the default
+
+    - name: setup cargo-make
+      uses: davidB/rust-cargo-make@v1
+
+    - name: make kotlin docs
+      run: |
+        mkdir -p target/doc/core_crypto_ffi/bindings/kotlin
+        cd crypto-ffi
         cargo make docs-kotlin
 
-    - name: Deploy Docs
-      uses: peaceiris/actions-gh-pages@v3
+    - uses: actions/upload-artifact@v4.5.0
+      with:
+        name: kotlin
+        path: target/kotlin/doc/html
+        retention-days: 1
+        overwrite: true
+        include-hidden-files: true
+
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    if: github.repository == 'wireapp/core-crypto' && (github.ref == 'refs/heads/main' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')))
+    needs:
+      - rustdoc
+      - tsdoc
+      - ktdoc
+    env:
+      GIT_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+
+    steps:
+    - name: checkout repository
+      uses: actions/checkout@v4
+
+    - name: download pre-rendered docs
+      uses: actions/download-artifact@v4.1.8
+      with:
+        path: "./target/doc/${{ env.GIT_TAG }}"
+        merge-multiple: false
+
+    - name: copy static files
+      run: |
+        cp docs/*.md target/doc/
+
+    - name: deploy docs
+      uses: peaceiris/actions-gh-pages@v4
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_branch: gh-pages
-        publish_dir: ./target/doc
-        force_orphan: true
+        publish_dir: target/doc
+        keep_files: true
+        force_orphan: false
+        enable_jekyll: true

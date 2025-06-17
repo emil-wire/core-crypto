@@ -1,18 +1,3 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
 #![allow(non_snake_case, dead_code, unused_macros, unused_imports)]
 
 pub use rstest::*;
@@ -23,14 +8,14 @@ const LEN_RANGE: std::ops::RangeInclusive<usize> = 128..=1024;
 mod fixtures;
 
 #[cfg(test)]
-pub mod tests {
-    use crate::fixtures::*;
+mod tests {
     use crate::LEN_RANGE;
+    use crate::fixtures::*;
     use hex_literal::hex;
     use mls_crypto_provider::{EntropySeed, MlsCryptoProvider};
     use openmls::prelude::Ciphersuite;
     use openmls_traits::types::HpkeKeyPair;
-    use openmls_traits::{crypto::OpenMlsCrypto, random::OpenMlsRand, OpenMlsCryptoProvider};
+    use openmls_traits::{OpenMlsCryptoProvider, crypto::OpenMlsCrypto, random::OpenMlsRand};
     use rand::Rng;
 
     use wasm_bindgen_test::*;
@@ -56,8 +41,8 @@ pub mod tests {
         ciphersuite: Ciphersuite,
         entropy_seed: Option<EntropySeed>,
     ) {
-        let mut backend = backend.await;
-        backend.reseed(entropy_seed);
+        let backend = backend.await;
+        backend.reseed(entropy_seed).unwrap();
         let len = rand::thread_rng().gen_range(LEN_RANGE);
         let crypto = backend.crypto();
         let ikm = hex!("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
@@ -89,8 +74,8 @@ pub mod tests {
         ciphersuite: Ciphersuite,
         entropy_seed: Option<EntropySeed>,
     ) {
-        let mut backend = backend.await;
-        backend.reseed(entropy_seed);
+        let backend = backend.await;
+        backend.reseed(entropy_seed).unwrap();
         let len = rand::thread_rng().gen_range(LEN_RANGE);
         let data = backend.rand().random_vec(len).unwrap();
         let crypto = backend.crypto();
@@ -108,8 +93,8 @@ pub mod tests {
         ciphersuite: Ciphersuite,
         entropy_seed: Option<EntropySeed>,
     ) {
-        let mut backend = backend.await;
-        backend.reseed(entropy_seed);
+        let backend = backend.await;
+        backend.reseed(entropy_seed).unwrap();
         let len = rand::thread_rng().gen_range(LEN_RANGE);
         let data = backend.rand().random_vec(len).unwrap();
         let aad = backend
@@ -142,8 +127,8 @@ pub mod tests {
         ciphersuite: Ciphersuite,
         entropy_seed: Option<EntropySeed>,
     ) {
-        let mut backend = backend.await;
-        backend.reseed(entropy_seed);
+        let backend = backend.await;
+        backend.reseed(entropy_seed).unwrap();
 
         let len = rand::thread_rng().gen_range(LEN_RANGE);
         let data = backend.rand().random_vec(len).unwrap();
@@ -166,8 +151,8 @@ pub mod tests {
         ciphersuite: Ciphersuite,
         entropy_seed: Option<EntropySeed>,
     ) {
-        let mut backend = backend.await;
-        backend.reseed(entropy_seed);
+        let backend = backend.await;
+        backend.reseed(entropy_seed).unwrap();
 
         let crypto = backend.crypto();
 

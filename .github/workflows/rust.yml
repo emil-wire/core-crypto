@@ -1,244 +1,106 @@
-name: Rust compile & test
+name: rust
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
-on: [push]
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
 
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: rustfmt
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - run: cargo fmt --all -- --check
-
-  check-strict:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - run: cargo check --tests
-      - run: cargo check --benches
-      - run: cargo doc --all --no-deps
-        env:
-          RUSTFLAGS: "-D warnings -W unreachable-pub"
-
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        command:
+          - cargo fmt --all -- --check
+          - cargo check --locked --all-targets
+          - cargo check --locked --target wasm32-unknown-unknown
+          - cargo clippy --locked --all-targets
+          - cargo clippy --locked --target wasm32-unknown-unknown
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: ./.github/actions/setup-and-cache-rust
         with:
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - run: cargo check --tests
-      - run: cargo check --benches
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-          components: clippy
+          components: rustfmt, clippy
           target: wasm32-unknown-unknown
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - run: cargo build --verbose
-      - run: cargo clippy -- -D warnings
-      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: ${{ matrix.command }}
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
+      - uses: ./.github/actions/setup-and-cache-rust
       - uses: taiki-e/install-action@nextest
-      - name: "Test CoreCrypto"
-        run: cargo nextest run --verbose
-      - name: "Test CoreCrypto documentation"
-        run: cargo test --doc
-      - name: "Test Keystore regressions"
-        run: |
-          cd extras/keystore-regression-versions
-          cargo run
+      - name: "test corecrypto"
+        run: cargo nextest run --verbose --locked
+      - name: "test corecrypto documentation"
+        run: cargo test --doc --locked
+      - name: "upload test results"
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/nextest/default/junit.xml
 
   proteus-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
+      - uses: ./.github/actions/setup-and-cache-rust
       - uses: taiki-e/install-action@nextest
-      - name: "Test CoreCrypto's proteus implementation"
-        run: cargo nextest run --verbose --features proteus,cryptobox-migrate,proteus-keystore proteus
-
-  # extract things unrelated to main tests not to slow them down
-  tooling-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - uses: taiki-e/install-action@nextest
-      - name: "Test CoreCrypto xtask tooling"
-        run: cargo nextest run --verbose --manifest-path xtask/Cargo.toml
-      - name: "Test CoreCrypto benchmarks"
-        run: sh crypto/benches/scripts/test.sh
-
-  wasm-build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        workspace: [ "crypto", "keystore", "mls-provider" ]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-unknown-unknown
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: WASM check
-        run: cargo check --tests --target wasm32-unknown-unknown
-      - name: WASM build
-        run: wasm-pack build --dev --target web ${{ matrix.workspace }}
-
+      - name: "test corecrypto's proteus implementation"
+        run: cargo nextest run --locked --verbose --features proteus,cryptobox-migrate,proteus-keystore proteus
 
   wasm-test:
     runs-on: ubuntu-latest
+    env:
+      WASM_BINDGEN_TEST_TIMEOUT: "1200" # if our test takes over 20m, it probably _should_ fail
     strategy:
       matrix:
-        workspace: ["core-crypto-keystore", "mls-crypto-provider"]
+        config:
+          - crate: keystore
+          - crate: mls-provider
+          - crate: keystore
+            feature: --features proteus-keystore
+            module: -- proteus
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: ./.github/actions/setup-and-cache-rust
         with:
           target: wasm32-unknown-unknown
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - uses: browser-actions/setup-chrome@latest
+      - uses: wireapp/setup-chrome@master
         id: setup-chrome
         with:
           chrome-version: stable
-      - run: |
-          echo "CHROME_PATH=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-      - name: Run tests (wasm)
-        run: cargo test --target wasm32-unknown-unknown -p ${{ matrix.workspace }}
-
-  # TODO: pending a proper solution to fix the size limit for WASM tests
-  wasm-core-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: echo "CHROME_PATH=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
+      - name: install wasm-pack
+        uses: taiki-e/install-action@v2
         with:
-          target: wasm32-unknown-unknown
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - uses: browser-actions/setup-chrome@latest
-        id: setup-chrome
-        with:
-          chrome-version: stable
-      - run: |
-          echo "CHROME_PATH=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-      - name: Run core tests (wasm)
-        run: sh crypto-ffi/bindings/js/test/wasm-tests.sh
-
-  proteus-wasm-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-unknown-unknown
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - uses: browser-actions/setup-chrome@latest
-        id: setup-chrome
-        with:
-          chrome-version: stable
-      - run: |
-          echo "CHROME_PATH=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-      - name: Run tests (wasm)
-        run: |
-          cargo test --features "proteus-keystore" --target wasm32-unknown-unknown -p core-crypto-keystore proteus
-          cargo test --features "proteus,cryptobox-migrate" --target wasm32-unknown-unknown -p core-crypto proteus
-
-  e2e-interop-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-unknown-unknown
-          rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Setup cargo-make
-        uses: davidB/rust-cargo-make@v1
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - uses: browser-actions/setup-chrome@latest
-        id: setup-chrome
-        with:
-          chrome-version: stable
-      - uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: latest
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-      - run: |
-          echo "CHROME_PATH=${{ steps.setup-chrome.outputs.chrome-path }}" >> $GITHUB_ENV
-      - name: Run E2E interop test
-        run: cargo run --bin interop
+          tool: wasm-pack
+      - run: wasm-pack test --headless --chrome ./${{ matrix.config.crate }} ${{ matrix.config.feature }} ${{ matrix.config.module }}
 
   hack:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: ./.github/actions/setup-and-cache-rust
+        # Per default, we're using "-D warnings" for rustflags. However, it's a lot of (unnecessary) effort to fix all "unused import"
+        # issue for every possible feature set, that's why we don't want to fail on warnings here. For this, we're passing
+        # an empty set of rustflags.
         with:
           rustflags: ''
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
       - uses: taiki-e/install-action@cargo-hack
       - name: cargo/hack (verify features compile in isolation)
-        run: cargo hack check --each-feature --exclude-features uniffi --no-dev-deps
+        run: cargo hack check --each-feature --no-dev-deps

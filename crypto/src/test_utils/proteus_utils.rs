@@ -1,19 +1,4 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
+use crate::test_utils::Result;
 use proteus_wasm::{
     keys::{IdentityKeyPair, PreKey},
     session::Session,
@@ -121,11 +106,12 @@ impl proteus_traits::PreKeyStore for PrekeyStore {
         &mut self,
         id: proteus_traits::RawPreKeyId,
     ) -> Result<Option<proteus_traits::RawPreKey>, Self::Error> {
-        if let Some(prekey) = self.0.iter().find(|k| k.key_id.value() == id) {
-            Ok(Some(prekey.serialise().unwrap()))
-        } else {
-            Ok(None)
-        }
+        let raw_prekey = self
+            .0
+            .iter()
+            .find(|k| k.key_id.value() == id)
+            .map(|prekey| prekey.serialise().unwrap());
+        Ok(raw_prekey)
     }
 
     async fn remove(&mut self, id: proteus_traits::RawPreKeyId) -> Result<(), Self::Error> {

@@ -1,7 +1,8 @@
+use std::hint::black_box;
+
 use core_crypto::prelude::MlsCredentialType;
 use criterion::{
-    async_executor::AsyncStdExecutor as FuturesExecutor, black_box, criterion_group, criterion_main, BatchSize,
-    Criterion,
+    BatchSize, Criterion, async_executor::AsyncStdExecutor as FuturesExecutor, criterion_group, criterion_main,
 };
 
 use crate::utils::*;
@@ -20,13 +21,15 @@ fn generate_key_package_bench(c: &mut Criterion) {
             group.bench_with_input(case.benchmark_id(i + 1, in_memory), &i, |b, i| {
                 b.to_async(FuturesExecutor).iter_batched(
                     || async_std::task::block_on(setup_mls(ciphersuite, credential.as_ref(), in_memory)),
-                    |(central, _)| async move {
+                    |(central, _, _)| async move {
+                        let context = central.new_transaction().await.unwrap();
                         black_box(
-                            central
+                            context
                                 .get_or_create_client_keypackages(ciphersuite, credential_type, *i)
                                 .await
                                 .unwrap(),
                         );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -50,20 +53,24 @@ fn count_key_packages_bench(c: &mut Criterion) {
                         async_std::task::block_on(async {
                             let (central, ..) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
 
-                            central
+                            let context = central.new_transaction().await.unwrap();
+                            context
                                 .get_or_create_client_keypackages(ciphersuite, credential_type, *i)
                                 .await
                                 .unwrap();
+                            context.finish().await.unwrap();
                             central
                         })
                     },
                     |central| async move {
+                        let context = central.new_transaction().await.unwrap();
                         black_box(
-                            central
+                            context
                                 .client_valid_key_packages_count(ciphersuite, credential_type)
                                 .await
                                 .unwrap(),
                         );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )

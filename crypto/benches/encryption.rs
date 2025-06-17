@@ -1,6 +1,7 @@
+use std::hint::black_box;
+
 use criterion::{
-    async_executor::AsyncStdExecutor as FuturesExecutor, black_box, criterion_group, criterion_main, BatchSize,
-    Criterion,
+    BatchSize, Criterion, async_executor::AsyncStdExecutor as FuturesExecutor, criterion_group, criterion_main,
 };
 use rand::distributions::{Alphanumeric, DistString};
 
@@ -17,14 +18,24 @@ fn encryption_bench_var_group_size(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, *i).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
                             let text = Alphanumeric.sample_string(&mut rand::thread_rng(), MSG_MAX);
                             (central, id, text)
                         })
                     },
-                    |(mut central, id, text)| async move {
-                        black_box(central.encrypt_message(&id, text).await.unwrap());
+                    |(central, id, text)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .encrypt_message(text)
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -42,14 +53,24 @@ fn encryption_bench_var_msg_size(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut central, &id, ciphersuite, GROUP_MAX).await;
+                            let (central, id, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, GROUP_MAX).await;
                             let text = Alphanumeric.sample_string(&mut rand::thread_rng(), *i);
                             (central, id, text)
                         })
                     },
-                    |(mut central, id, text)| async move {
-                        black_box(central.encrypt_message(&id, text).await.unwrap());
+                    |(central, id, text)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .encrypt_message(text)
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -67,17 +88,36 @@ fn decryption_bench_var_msg_size(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut alice_central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
+                            let (mut alice_central, id, delivery_service) =
+                                setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
                             let (mut bob_central, ..) = new_central(ciphersuite, credential.as_ref(), in_memory).await;
-                            invite(&mut alice_central, &mut bob_central, &id, ciphersuite).await;
+                            invite(&mut alice_central, &mut bob_central, &id, ciphersuite, delivery_service).await;
 
+                            let context = alice_central.new_transaction().await.unwrap();
                             let text = Alphanumeric.sample_string(&mut rand::thread_rng(), *i);
-                            let encrypted = alice_central.encrypt_message(&id, text).await.unwrap();
+                            let encrypted = context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .encrypt_message(text)
+                                .await
+                                .unwrap();
+                            context.finish().await.unwrap();
                             (bob_central, id, encrypted)
                         })
                     },
-                    |(mut central, id, encrypted)| async move {
-                        black_box(central.decrypt_message(&id, encrypted).await.unwrap());
+                    |(central, id, encrypted)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(
+                            context
+                                .conversation(&id)
+                                .await
+                                .unwrap()
+                                .decrypt_message(encrypted)
+                                .await
+                                .unwrap(),
+                        );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )

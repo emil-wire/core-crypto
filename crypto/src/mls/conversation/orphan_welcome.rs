@@ -3,58 +3,47 @@
 //! Feel free to remove this when this is no longer a problem !!!
 
 #[cfg(test)]
-pub mod tests {
-    use crate::CryptoError;
+mod tests {
+
     use openmls::prelude::KeyPackage;
     use openmls_traits::OpenMlsCryptoProvider;
-    use wasm_bindgen_test::*;
 
+    use super::super::error::Error;
     use crate::test_utils::*;
 
-    wasm_bindgen_test_configure!(run_in_browser);
-
     #[apply(all_cred_cipher)]
-    #[wasm_bindgen_test]
-    pub async fn orphan_welcome_should_generate_external_commit(case: TestCase) {
-        run_test_with_client_ids(
-            case.clone(),
-            ["alice", "bob"],
-            move |[mut alice_central, mut bob_central]| {
-                Box::pin(async move {
-                    let id = conversation_id();
+    pub async fn orphan_welcome_should_generate_external_commit(case: TestContext) {
+        let [alice, bob] = case.sessions().await;
+        Box::pin(async move {
+            let conversation = case.create_conversation([&alice]).await;
 
-                    alice_central
-                        .mls_central
-                        .new_conversation(&id, case.credential_type, case.cfg.clone())
-                        .await
-                        .unwrap();
+                let bob_kp = bob.rand_key_package(&case).await;
+                let bob_kp_ref = KeyPackage::from(bob_kp.clone())
+                    .hash_ref(bob.transaction.mls_provider().await.unwrap().crypto())
+                    .unwrap();
 
-                    let bob = bob_central.mls_central.rand_key_package(&case).await;
-                    let bob_kp_ref = KeyPackage::from(bob.clone())
-                        .hash_ref(bob_central.mls_central.mls_backend.crypto())
-                        .unwrap();
+                // Alice invites Bob with a KeyPackage...
+                conversation.guard().await
+                    .add_members(vec![bob_kp])
+                    .await
+                    .unwrap();
 
-                    // Alice invites Bob with a KeyPackage...
-                    let welcome = alice_central
-                        .mls_central
-                        .add_members_to_conversation(&id, vec![bob])
-                        .await
-                        .unwrap()
-                        .welcome;
+                // ...Bob deletes locally (with the associated private key) before processing the Welcome
+                bob.transaction.delete_keypackages(&[bob_kp_ref]).await.unwrap();
 
-                    // ...Bob deletes locally (with the associated private key) before processing the Welcome
-                    bob_central.mls_central.delete_keypackages(&[bob_kp_ref]).await.unwrap();
+                let welcome = alice.mls_transport().await.latest_welcome_message().await;
 
-                    // in that case a dedicated error is thrown for clients to identify this case
-                    // and rejoin with an external commit
-                    let process_welcome = bob_central
-                        .mls_central
-                        .process_welcome_message(welcome.into(), case.custom_cfg())
-                        .await;
-                    assert!(matches!(process_welcome.unwrap_err(), CryptoError::OrphanWelcome));
-                })
-            },
-        )
+                // in that case a dedicated error is thrown for clients to identify this case
+                // and rejoin with an external commit
+                let process_welcome = bob
+                    .transaction
+                    .process_welcome_message(welcome.into(), case.custom_cfg())
+                    .await;
+                assert!(matches!(
+                    process_welcome.unwrap_err(),
+                    crate::transaction_context::Error::Recursive(crate::RecursiveError::MlsConversation { source, .. }) if matches!(*source, Error::OrphanWelcome)
+                ));
+            })
         .await;
     }
 }

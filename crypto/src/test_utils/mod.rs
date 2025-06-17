@@ -1,60 +1,228 @@
-// Wire
-// Copyright (C) 2022 Wire Swiss GmbH
+// disabling the requirement for documentation here because these test utils should not be held to the same standard,
+// and historically have not been.
+#![allow(missing_docs)]
 
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see http://www.gnu.org/licenses/.
-
-#![cfg(test)]
-
-use mls_crypto_provider::PkiKeypair;
-use openmls_traits::types::SignatureScheme;
-pub use rstest::*;
-pub use rstest_reuse::{self, *};
-use std::collections::HashMap;
-
-use crate::{
-    prelude::{ClientId, ConversationId, E2eiEnrollment, MlsCentral, MlsCentralConfiguration},
-    test_utils::x509::{CertificateParams, X509TestChain, X509TestChainActorArg, X509TestChainArgs},
-    CoreCryptoCallbacks,
-};
-
-pub mod central;
-pub mod fixtures;
+pub mod context;
+mod epoch_observer;
+mod error;
 pub mod message;
+pub mod test_context;
+mod test_conversation;
 pub mod x509;
 // Cannot name it `proteus` because then it conflicts with proteus the crate :(
 #[cfg(feature = "proteus")]
 pub mod proteus_utils;
 
-use crate::e2e_identity::id::{QualifiedE2eiClientId, WireQualifiedClientId};
-use crate::prelude::{ClientIdentifier, MlsCredentialType, INITIAL_KEYING_MATERIAL_COUNT};
-pub use fixtures::{TestCase, *};
-pub use message::*;
+pub(crate) use self::epoch_observer::TestEpochObserver;
+use self::error::Result;
+pub use self::{error::Error as TestError, message::*, test_context::*, test_conversation::TestConversation};
+pub use crate::prelude::{ClientIdentifier, INITIAL_KEYING_MATERIAL_COUNT, MlsCredentialType};
+use crate::{
+    CoreCrypto, MlsTransport, MlsTransportResponse, RecursiveError,
+    e2e_identity::id::QualifiedE2eiClientId,
+    prelude::{
+        CertificateBundle, ClientId, ConversationId, MlsClientConfiguration, MlsCommitBundle, MlsGroupInfoBundle,
+        Session,
+    },
+    test_utils::x509::{CertificateParams, X509TestChain, X509TestChainActorArg, X509TestChainArgs},
+    transaction_context::TransactionContext,
+};
+use core_crypto_keystore::DatabaseKey;
 
-// FIXME: This takes around 10 minutes on WASM
-// #[cfg(debug_assertions)]
+use async_lock::RwLock;
+use openmls::framing::MlsMessageOut;
+pub use openmls_traits::types::SignatureScheme;
+
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
+
 pub const GROUP_SAMPLE_SIZE: usize = 9;
-// #[cfg(not(debug_assertions))]
-// pub const GROUP_SAMPLE_SIZE: usize = 99;
 
-#[derive(Debug)]
-pub struct ClientContext {
-    pub mls_central: MlsCentral,
-    pub initial_identifier: String,
-    pub x509_test_chain: std::sync::Arc<Option<X509TestChain>>,
+/// Trace up the error's source chain, and return whether the innermost matches the
+/// provided pattern, and guard if supplied.
+///
+/// Basic syntax matches that of [`std::matches`].
+///
+/// In case the innermost error of your type is wrapped in a `Box` or similar, you can use
+/// an expanded syntax: after the pattern or guard expression, a third argument like
+/// `deref Box<ExpectedType>: *`. If you have a more deeply nested type, you can add as
+/// many deref operations (stars) as you need.
+///
+/// We can't write `fn innermost_source` because Rust can't prove that the innermost
+/// error lives as long as the original error, and demands that it live as long as
+/// `'static`, which is unhelpful. But we can inline the whole thing with a macro, as here.
+macro_rules! innermost_source_matches {
+    // sure would be nice if we didn't have to write the whole body of this macro twice here.
+    // doesn't work though: pass the `matches!` line as a simple `matches!` expression, and
+    // `err` is out of scope in the outer context.
+    // pass it as a lambda expression taking `err` as a function, and rustc decides that somehow
+    // we're causing borrowed data to escape from a closure's scope.
+    ($err:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
+        let mut err: &dyn std::error::Error = &$err;
+        while let Some(inner) = err.source() {
+            err = inner;
+        }
+
+        let outcome = matches!(err.downcast_ref(), Some($pattern) $(if $guard)?);
+        if !outcome {
+            eprintln!("{err:?}: {err}");
+        }
+
+        outcome
+    }};
+    ($err:expr, $pattern:pat $(if $guard:expr)?, deref $t:ty : $($deref:tt)* $(,)?) => {{
+        let mut err: &dyn std::error::Error = &$err;
+        while let Some(inner) = err.source() {
+            err = inner;
+        }
+
+        let outcome = matches!(err.downcast_ref::<$t>().map(|t| &*$($deref)* t), Some($pattern) $(if $guard)?);
+        if !outcome {
+            eprintln!("{err:?}: {err}");
+        }
+
+        outcome
+    }};
+}
+pub(crate) use innermost_source_matches;
+
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub transaction: TransactionContext,
+    pub session: Session,
+    mls_transport: Arc<RwLock<Arc<dyn MlsTransportTestExt + 'static>>>,
+    x509_test_chain: std::sync::Arc<Option<X509TestChain>>,
+    // We need to store the `TempDir` struct for the duration of the test session,
+    // because its drop implementation takes care of the directory deletion.
+    #[cfg(not(target_family = "wasm"))]
+    _db_file: (String, Arc<tempfile::TempDir>),
+    #[cfg(target_family = "wasm")]
+    _db_file: (String, ()),
 }
 
-impl ClientContext {
+#[derive(Default, Clone, Copy)]
+pub enum TestCertificateSource {
+    /// Can be used in all x509 tests that don't use cross-signed certificate chains
+    #[default]
+    Generated,
+    /// Must be used in contexts where using cross-signed certificate chains
+    TestChainActor(usize),
+}
+
+impl SessionContext {
+    /// Use this if you want to instantiate a session with a credential different from
+    /// the default one of the test context
+    pub async fn new_with_identifier(
+        context: &TestContext,
+        identifier: ClientIdentifier,
+        chain: Option<&X509TestChain>,
+    ) -> crate::Result<Self> {
+        // We need to store the `TempDir` struct for the duration of the test session,
+        // because its drop implementation takes care of the directory deletion.
+        let (db_dir_string, db_dir) = tmp_db_file();
+        let transport = context.transport.clone();
+        let configuration = MlsClientConfiguration::try_new(
+            db_dir_string.clone(),
+            DatabaseKey::generate(),
+            None,
+            vec![context.cfg.ciphersuite],
+            None,
+            Some(INITIAL_KEYING_MATERIAL_COUNT),
+        )
+        .unwrap();
+        let session = Session::try_new(configuration).await.unwrap();
+        let cc = CoreCrypto::from(session);
+        let transaction = cc.new_transaction().await.unwrap();
+        let session = cc.mls;
+        // Setup the X509 PKI environment
+        if let Some(chain) = chain.as_ref() {
+            chain.register_with_central(&transaction).await;
+        }
+
+        transaction
+            .mls_init(
+                identifier,
+                vec![context.cfg.ciphersuite],
+                Some(INITIAL_KEYING_MATERIAL_COUNT),
+            )
+            .await
+            .map_err(RecursiveError::transaction("mls init"))?;
+        session.provide_transport(transport.clone()).await;
+
+        let result = Self {
+            transaction,
+            session,
+            mls_transport: Arc::new(RwLock::new(transport)),
+            x509_test_chain: Arc::new(chain.cloned()),
+            #[cfg(not(target_family = "wasm"))]
+            _db_file: (db_dir_string, Arc::new(db_dir)),
+            #[cfg(target_family = "wasm")]
+            _db_file: (db_dir_string, db_dir),
+        };
+        Ok(result)
+    }
+
+    pub(crate) async fn new_uninitialized(context: &TestContext) -> Self {
+        let (db_dir_string, db_dir) = tmp_db_file();
+        let ciphersuites = vec![context.cfg.ciphersuite];
+        let configuration = MlsClientConfiguration::try_new(
+            db_dir_string.clone(),
+            DatabaseKey::generate(),
+            None,
+            ciphersuites,
+            None,
+            Some(INITIAL_KEYING_MATERIAL_COUNT),
+        )
+        .unwrap();
+        let client = Session::try_new(configuration).await.unwrap();
+        let transport = Arc::<CoreCryptoTransportSuccessProvider>::default();
+        client.provide_transport(transport.clone()).await;
+        let cc = CoreCrypto::from(client);
+        let context = cc.new_transaction().await.unwrap();
+        Self {
+            transaction: context.clone(),
+            session: cc.mls,
+            mls_transport: Arc::new(RwLock::new(transport.clone())),
+            x509_test_chain: None.into(),
+            #[cfg(not(target_family = "wasm"))]
+            _db_file: (db_dir_string, Arc::new(db_dir)),
+            #[cfg(target_family = "wasm")]
+            _db_file: (db_dir_string, db_dir),
+        }
+    }
+
+    fn x509_client_id(
+        client_id: &ClientId,
+        signature_scheme: SignatureScheme,
+        cert_source: &TestCertificateSource,
+        chain: &X509TestChain,
+    ) -> ClientIdentifier {
+        // Take bundle from chain or generate a new one
+        let bundle = match cert_source {
+            TestCertificateSource::Generated => {
+                crate::prelude::CertificateBundle::rand(client_id, chain.find_local_intermediate_ca())
+            }
+            TestCertificateSource::TestChainActor(i) => {
+                use x509_cert::der::Encode as _;
+                let actor = chain
+                                .actors
+                                .get(*i)
+                                .expect("if using test chain actors, you must have enough actors in the list. Did you mean to generate a certificate?");
+                let actor_cert = &actor.certificate;
+                let cert_der = actor_cert.certificate.to_der().unwrap();
+                CertificateBundle {
+                    certificate_chain: vec![cert_der],
+                    private_key: crate::mls::credential::x509::CertificatePrivateKey {
+                        signature_scheme,
+                        value: actor_cert.pki_keypair.signing_key_bytes(),
+                    },
+                }
+            }
+        };
+        ClientIdentifier::X509(HashMap::from([(signature_scheme, bundle)]))
+    }
+
     pub fn x509_chain_unchecked(&self) -> &X509TestChain {
         self.x509_test_chain
             .as_ref()
@@ -66,42 +234,45 @@ impl ClientContext {
         self.x509_test_chain = new_chain;
     }
 
-    /// Order of priority: Enrollment, X509TestChain, MlsCentral's most recent credential bundle
-    pub async fn client_initial_pki_keypair(
-        &self,
-        sc: SignatureScheme,
-        ct: MlsCredentialType,
-        enrollment: Option<&E2eiEnrollment>,
-    ) -> Option<PkiKeypair> {
-        if let Some(enrollment) = enrollment {
-            return Some(PkiKeypair::new(sc, enrollment.sign_sk.to_vec()).unwrap());
-        }
+    pub async fn session(&self) -> Session {
+        self.session.clone()
+    }
 
-        if let Some(x509_test_chain) = self.x509_test_chain.as_ref().as_ref() {
-            return x509_test_chain
-                .find_certificate_for_actor(&self.initial_identifier)
-                .map(|cert| cert.pki_keypair.clone());
-        }
+    pub async fn get_client_id(&self) -> ClientId {
+        self.session.id().await.unwrap()
+    }
 
-        self.mls_central
-            .find_most_recent_credential_bundle(sc, ct)
+    pub async fn replace_transport(&self, new_transport: Arc<dyn MlsTransportTestExt>) {
+        self.transaction
+            .set_transport_callbacks(Some(new_transport.clone()))
             .await
-            .map(|cred_bundle| PkiKeypair::new(sc, cred_bundle.signature_key.private().into()).unwrap())
+            .unwrap();
+
+        let mut transport_guard = self.mls_transport.write().await;
+        *transport_guard = new_transport;
+    }
+
+    pub async fn mls_transport(&self) -> Arc<dyn MlsTransportTestExt> {
+        self.mls_transport.read().await.clone()
     }
 }
 
-fn init_x509_test_chain(case: &TestCase, client_ids: &[[&str; 3]]) -> X509TestChain {
-    let default_params = CertificateParams::default();
+fn init_x509_test_chain(
+    case: &TestContext,
+    client_ids: &[[&str; 3]],
+    revoked_display_names: &[&str],
+    cert_params: CertificateParams,
+) -> X509TestChain {
     let root_params = {
-        let mut params = default_params.clone();
-        if let Some(root_cn) = &default_params.common_name {
+        let mut params = cert_params.clone();
+        if let Some(root_cn) = &cert_params.common_name {
             params.common_name.replace(format!("{} Root CA", root_cn));
         }
         params
     };
     let local_ca_params = {
-        let mut params = default_params.clone();
-        if let Some(root_cn) = &default_params.common_name {
+        let mut params = cert_params.clone();
+        if let Some(root_cn) = &cert_params.common_name {
             params.common_name.replace(format!("{} Intermediate CA", root_cn));
         }
         params
@@ -123,7 +294,7 @@ fn init_x509_test_chain(case: &TestCase, client_ids: &[[&str; 3]]) -> X509TestCh
             } else {
                 client_id.to_string()
             },
-            is_revoked: false, // TODO: Add tests for revocation
+            is_revoked: revoked_display_names.contains(display_name),
         })
         .collect();
 
@@ -131,156 +302,15 @@ fn init_x509_test_chain(case: &TestCase, client_ids: &[[&str; 3]]) -> X509TestCh
         root_params,
         local_ca_params,
         signature_scheme: case.signature_scheme(),
-        federated_test_chains: &[],
         local_actors,
         dump_pem_certs: false,
     })
 }
 
-pub async fn run_test_with_central(
-    case: TestCase,
-    test: impl FnOnce([ClientContext; 1]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> + 'static,
-) {
-    run_test_with_client_ids(case.clone(), ["alice"], test).await
-}
-
-pub async fn run_test_with_client_ids<const N: usize>(
-    case: TestCase,
-    client_ids: [&'static str; N],
-    test: impl FnOnce([ClientContext; N]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> + 'static,
-) {
-    run_test_with_deterministic_client_ids(case, client_ids.map(|display_name| ["", "", display_name]), test).await
-}
-
-pub async fn run_test_with_deterministic_client_ids<const N: usize>(
-    case: TestCase,
-    client_ids: [[&'static str; 3]; N],
-    test: impl FnOnce([ClientContext; N]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> + 'static,
-) {
-    run_tests(move |paths: [String; N]| {
-        Box::pin(async move {
-            let x509_test_chain = std::sync::Arc::new(case.is_x509().then(|| init_x509_test_chain(&case, &client_ids)));
-
-            let path_x509_chains: Vec<std::sync::Arc<Option<X509TestChain>>> =
-                (0..paths.len()).map(|_| x509_test_chain.clone()).collect();
-
-            let stream = paths
-                .into_iter()
-                .enumerate()
-                .zip(path_x509_chains.into_iter())
-                .zip(client_ids)
-                .map(|(((i, p), x509_test_chain), [_, _, initial_identifier])| async move {
-                    let configuration = MlsCentralConfiguration::try_new(
-                        p,
-                        "test".into(),
-                        None,
-                        vec![case.cfg.ciphersuite],
-                        None,
-                        Some(INITIAL_KEYING_MATERIAL_COUNT),
-                    )
-                    .unwrap();
-                    let mut central = MlsCentral::try_new(configuration).await.unwrap();
-
-                    // Setup the X509 PKI environment
-                    if let Some(x509_test_chain) = x509_test_chain.as_ref() {
-                        x509_test_chain.register_with_central(&central).await;
-                    }
-
-                    let identity = match case.credential_type {
-                        MlsCredentialType::Basic => {
-                            let client_id: ClientId = WireQualifiedClientId::generate().into();
-                            ClientIdentifier::Basic(client_id)
-                        }
-                        MlsCredentialType::X509 => {
-                            use x509_cert::der::Encode as _;
-                            let sc = case.cfg.ciphersuite.signature_algorithm();
-                            let actor_cert = &x509_test_chain.as_ref().as_ref().unwrap().actors[i];
-                            let cert_der = actor_cert.certificate.certificate.to_der().unwrap();
-                            let bundle = crate::prelude::CertificateBundle {
-                                certificate_chain: vec![cert_der],
-                                private_key: crate::mls::credential::x509::CertificatePrivateKey {
-                                    signature_scheme: sc,
-                                    value: actor_cert.certificate.pki_keypair.signing_key_bytes(),
-                                },
-                            };
-
-                            ClientIdentifier::X509(HashMap::from([(sc, bundle)]))
-                        }
-                    };
-                    central
-                        .mls_init(
-                            identity,
-                            vec![case.cfg.ciphersuite],
-                            Some(INITIAL_KEYING_MATERIAL_COUNT),
-                        )
-                        .await
-                        .unwrap();
-                    central.callbacks(Box::<ValidationCallbacks>::default());
-                    ClientContext {
-                        mls_central: central,
-                        initial_identifier: initial_identifier.into(),
-                        x509_test_chain,
-                    }
-                });
-            let centrals: [ClientContext; N] = futures_util::future::join_all(stream).await.try_into().unwrap();
-            test(centrals).await;
-        })
-    })
-    .await
-}
-
-pub async fn run_test_wo_clients(
-    case: TestCase,
-    test: impl FnOnce(ClientContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> + 'static,
-) {
-    run_tests(move |paths: [String; 1]| {
-        Box::pin(async move {
-            let p = paths.first().unwrap();
-            // let x509_test_chain = X509TestChain::init_empty(case.signature_scheme());
-
-            let ciphersuites = vec![case.cfg.ciphersuite];
-            let configuration = MlsCentralConfiguration::try_new(
-                p.to_string(),
-                "test".into(),
-                None,
-                ciphersuites,
-                None,
-                Some(INITIAL_KEYING_MATERIAL_COUNT),
-            )
-            .unwrap();
-            let mut central = MlsCentral::try_new(configuration).await.unwrap();
-            central.callbacks(Box::<ValidationCallbacks>::default());
-            test(ClientContext {
-                mls_central: central,
-                initial_identifier: String::from("nobody"),
-                x509_test_chain: None.into(),
-            })
-            .await
-        })
-    })
-    .await
-}
-
-pub async fn run_tests<const N: usize>(
-    test: impl FnOnce([String; N]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>> + 'static,
-) {
-    let _ = pretty_env_logger::try_init();
-    let paths: [(String, _); N] = (0..N).map(|_| tmp_db_file()).collect::<Vec<_>>().try_into().unwrap();
-    // We need to store TempDir because they impl Drop which would delete the file before test begins
-    let cloned_paths = paths
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    test(cloned_paths).await;
-    drop(paths);
-}
-
 #[cfg(not(target_family = "wasm"))]
 pub fn tmp_db_file() -> (String, tempfile::TempDir) {
     let file = tempfile::tempdir().unwrap();
-    (MlsCentralConfiguration::tmp_store_path(&file), file)
+    (MlsClientConfiguration::tmp_store_path(&file), file)
 }
 
 #[cfg(target_family = "wasm")]
@@ -295,46 +325,200 @@ pub fn conversation_id() -> ConversationId {
     ConversationId::from(format!("{}@conversations.wire.com", uuid.hyphenated()))
 }
 
-#[derive(Debug)]
-pub struct ValidationCallbacks {
-    pub authorize: bool,
-    pub user_authorize: bool,
-    pub client_is_existing_group_user: bool,
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+pub trait MlsTransportTestExt: MlsTransport {
+    async fn latest_commit_bundle(&self) -> MlsCommitBundle;
+    async fn latest_welcome_message(&self) -> MlsMessageOut {
+        self.latest_commit_bundle().await.welcome.unwrap().clone()
+    }
+
+    async fn latest_commit(&self) -> MlsMessageOut {
+        self.latest_commit_bundle().await.commit.clone()
+    }
+
+    async fn latest_group_info(&self) -> MlsGroupInfoBundle {
+        self.latest_commit_bundle().await.group_info.clone()
+    }
+
+    async fn latest_message(&self) -> Vec<u8>;
 }
 
-impl Default for ValidationCallbacks {
-    fn default() -> Self {
-        Self {
-            authorize: true,
-            user_authorize: true,
-            client_is_existing_group_user: true,
+#[derive(Debug, Default)]
+pub struct CoreCryptoTransportSuccessProvider {
+    latest_commit_bundle: RwLock<Option<MlsCommitBundle>>,
+    latest_message: RwLock<Option<Vec<u8>>>,
+}
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+impl MlsTransport for CoreCryptoTransportSuccessProvider {
+    async fn send_commit_bundle(&self, commit_bundle: MlsCommitBundle) -> crate::Result<MlsTransportResponse> {
+        self.latest_commit_bundle.write().await.replace(commit_bundle);
+        Ok(MlsTransportResponse::Success)
+    }
+
+    async fn send_message(&self, mls_message: Vec<u8>) -> crate::Result<MlsTransportResponse> {
+        self.latest_message.write().await.replace(mls_message);
+        Ok(MlsTransportResponse::Success)
+    }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+impl MlsTransportTestExt for CoreCryptoTransportSuccessProvider {
+    async fn latest_commit_bundle(&self) -> MlsCommitBundle {
+        self.latest_commit_bundle
+            .read()
+            .await
+            .clone()
+            .expect("latest_commit_bundle")
+    }
+
+    async fn latest_message(&self) -> Vec<u8> {
+        self.latest_message.read().await.clone().expect("latest_message")
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CoreCryptoTransportAbortProvider;
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+impl MlsTransport for CoreCryptoTransportAbortProvider {
+    async fn send_commit_bundle(&self, _commit_bundle: MlsCommitBundle) -> crate::Result<MlsTransportResponse> {
+        Ok(MlsTransportResponse::Abort {
+            reason: "abort provider always aborts!".to_string(),
+        })
+    }
+
+    async fn send_message(&self, _mls_message: Vec<u8>) -> crate::Result<MlsTransportResponse> {
+        Ok(MlsTransportResponse::Abort {
+            reason: "abort provider always aborts!".to_string(),
+        })
+    }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+impl MlsTransportTestExt for CoreCryptoTransportAbortProvider {
+    async fn latest_commit_bundle(&self) -> MlsCommitBundle {
+        unreachable!("abort provider never stores a commit bundle")
+    }
+
+    async fn latest_message(&self) -> Vec<u8> {
+        unreachable!("abort provider never stores a message")
+    }
+}
+
+/// This alternates between retry and success responses (starts with retry).
+#[derive(Debug, Default)]
+pub struct CoreCryptoTransportRetrySuccessProvider {
+    latest_commit_bundle: RwLock<Option<MlsCommitBundle>>,
+    latest_message: RwLock<Option<Vec<u8>>>,
+    just_returned_retry: RwLock<bool>,
+    retry_count: RwLock<u32>,
+    success_count: RwLock<u32>,
+    intermediate_commits: RwLock<Option<IntermediateCommits>>,
+}
+
+#[derive(Debug, Clone)]
+struct IntermediateCommits {
+    receiver: SessionContext,
+    conversation_id: ConversationId,
+    commits: Arc<[MlsMessageOut]>,
+}
+
+impl CoreCryptoTransportRetrySuccessProvider {
+    /// Adds intermediate commits that will be consumed and processed before the next time `Retry` is returned.
+    pub fn with_intermediate_commits(
+        mut self,
+        receiver: SessionContext,
+        commits: &[MlsMessageOut],
+        conversation_id: &ConversationId,
+    ) -> Self {
+        self.intermediate_commits = Some(IntermediateCommits {
+            receiver,
+            commits: commits.into(),
+            conversation_id: conversation_id.clone(),
+        })
+        .into();
+        self
+    }
+
+    pub async fn retry_count(&self) -> u32 {
+        *self.retry_count.read().await
+    }
+
+    pub async fn success_count(&self) -> u32 {
+        *self.success_count.read().await
+    }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+impl MlsTransport for CoreCryptoTransportRetrySuccessProvider {
+    async fn send_commit_bundle(&self, commit_bundle: MlsCommitBundle) -> crate::Result<MlsTransportResponse> {
+        let mut just_returned_retry = self.just_returned_retry.write().await;
+        if *just_returned_retry {
+            *just_returned_retry = false;
+            *self.success_count.write().await += 1;
+            self.latest_commit_bundle.write().await.replace(commit_bundle);
+            Ok(MlsTransportResponse::Success)
+        } else {
+            *just_returned_retry = true;
+            *self.retry_count.write().await += 1;
+            let mut intermediate_commits = self.intermediate_commits.write().await;
+            let Some(IntermediateCommits {
+                receiver,
+                conversation_id,
+                commits,
+            }) = intermediate_commits.deref()
+            else {
+                return Ok(MlsTransportResponse::Retry);
+            };
+            for commit in commits.iter() {
+                receiver
+                    .transaction
+                    .conversation(conversation_id)
+                    .await
+                    .expect("conversation guard")
+                    .decrypt_message(commit.to_bytes().expect("reading bytes from intermediate commit"))
+                    .await
+                    .expect("processed intermediate commit");
+            }
+            *intermediate_commits = None;
+            Ok(MlsTransportResponse::Retry)
+        }
+    }
+
+    async fn send_message(&self, mls_message: Vec<u8>) -> crate::Result<MlsTransportResponse> {
+        let mut just_returned_retry = self.just_returned_retry.write().await;
+        if *just_returned_retry {
+            self.latest_message.write().await.replace(mls_message);
+            *just_returned_retry = false;
+            *self.success_count.write().await += 1;
+            Ok(MlsTransportResponse::Success)
+        } else {
+            *just_returned_retry = true;
+            *self.retry_count.write().await += 1;
+            Ok(MlsTransportResponse::Retry)
         }
     }
 }
 
 #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
-impl CoreCryptoCallbacks for ValidationCallbacks {
-    async fn authorize(&self, _conversation_id: ConversationId, _client_id: ClientId) -> bool {
-        self.authorize
+impl MlsTransportTestExt for CoreCryptoTransportRetrySuccessProvider {
+    async fn latest_commit_bundle(&self) -> MlsCommitBundle {
+        self.latest_commit_bundle
+            .read()
+            .await
+            .clone()
+            .expect("latest_commit_bundle")
     }
 
-    async fn user_authorize(
-        &self,
-        _conversation_id: ConversationId,
-        _external_client_id: ClientId,
-        _existing_clients: Vec<ClientId>,
-    ) -> bool {
-        self.user_authorize
-    }
-
-    async fn client_is_existing_group_user(
-        &self,
-        _conversation_id: ConversationId,
-        _client_id: ClientId,
-        _existing_clients: Vec<ClientId>,
-        _parent_conversation_clients: Option<Vec<ClientId>>,
-    ) -> bool {
-        self.client_is_existing_group_user
+    async fn latest_message(&self) -> Vec<u8> {
+        self.latest_message.read().await.clone().expect("latest_message")
     }
 }

@@ -1,17 +1,18 @@
+use std::hint::black_box;
+
 use criterion::{
-    async_executor::AsyncStdExecutor as FuturesExecutor, black_box, criterion_group, criterion_main, BatchSize,
-    BenchmarkId, Criterion,
+    BatchSize, BenchmarkId, Criterion, async_executor::AsyncStdExecutor as FuturesExecutor, criterion_group,
+    criterion_main,
 };
 
-use core_crypto::prelude::{
-    MlsConversationConfiguration, MlsConversationInitBundle, MlsCredentialType, MlsCustomConfiguration,
-};
+use core_crypto::prelude::{MlsConversationConfiguration, MlsCredentialType, MlsCustomConfiguration};
 
 use crate::utils::*;
 
 #[path = "utils/mod.rs"]
 mod utils;
 
+/// Benchmark to measure the runtime of creating a group.
 fn create_group_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Create group");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -31,11 +32,13 @@ fn create_group_bench(c: &mut Criterion) {
                             (central, id, cfg)
                         })
                     },
-                    |(mut central, id, cfg)| async move {
-                        central
+                    |(central, id, cfg)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        context
                             .new_conversation(&id, MlsCredentialType::Basic, cfg)
                             .await
                             .unwrap();
+                        context.finish().await.unwrap();
                         black_box(());
                     },
                     BatchSize::SmallInput,
@@ -46,6 +49,7 @@ fn create_group_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure the impact of group size on the runtime of joining a group from a welcome message.
 fn join_from_welcome_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Join from welcome f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -54,30 +58,39 @@ fn join_from_welcome_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut alice_central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            add_clients(&mut alice_central, &id, ciphersuite, *i).await;
+                            let (alice_central, id, _, _, delivery_service) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
 
                             let (bob_central, ..) = new_central(ciphersuite, credential.as_ref(), in_memory).await;
-                            let bob_kpbs = bob_central
+                            let bob_context = bob_central.new_transaction().await.unwrap();
+                            let bob_kpbs = bob_context
                                 .get_or_create_client_keypackages(ciphersuite, MlsCredentialType::Basic, 1)
                                 .await
                                 .unwrap();
                             let bob_kp = bob_kpbs.first().unwrap().clone();
-                            let welcome = alice_central
-                                .add_members_to_conversation(&id, vec![bob_kp.into()])
+                            bob_context.finish().await.unwrap();
+                            let alice_context = alice_central.new_transaction().await.unwrap();
+                            alice_context
+                                .conversation(&id)
                                 .await
                                 .unwrap()
-                                .welcome;
+                                .add_members(vec![bob_kp.into()])
+                                .await
+                                .unwrap();
+                            let welcome = delivery_service.latest_welcome_message().await;
+                            alice_context.finish().await.unwrap();
                             (bob_central, welcome)
                         })
                     },
-                    |(mut central, welcome)| async move {
+                    |(central, welcome)| async move {
+                        let context = central.new_transaction().await.unwrap();
                         black_box(
-                            central
+                            context
                                 .process_welcome_message(welcome.into(), MlsCustomConfiguration::default())
                                 .await
                                 .unwrap(),
                         );
+                        context.finish().await.unwrap();
                     },
                     BatchSize::SmallInput,
                 )
@@ -87,6 +100,7 @@ fn join_from_welcome_bench(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark to measure the impact of group size on the runtime of joining a group via an external commit.
 fn join_from_group_info_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("Join from external commit f(group size)");
     for (case, ciphersuite, credential, in_memory) in MlsTestCase::values() {
@@ -95,15 +109,16 @@ fn join_from_group_info_bench(c: &mut Criterion) {
                 b.to_async(FuturesExecutor).iter_batched(
                     || {
                         async_std::task::block_on(async {
-                            let (mut alice_central, id) = setup_mls(ciphersuite, credential.as_ref(), in_memory).await;
-                            let (_, group_info) = add_clients(&mut alice_central, &id, ciphersuite, *i).await;
+                            let (_, _, _, group_info, ..) =
+                                setup_mls_and_add_clients(ciphersuite, credential.as_ref(), in_memory, *i).await;
                             let (bob_central, ..) = new_central(ciphersuite, credential.as_ref(), in_memory).await;
                             (bob_central, group_info)
                         })
                     },
-                    |(mut central, group_info)| async move {
-                        let MlsConversationInitBundle { conversation_id, .. } = black_box(
-                            central
+                    |(central, group_info)| async move {
+                        let context = central.new_transaction().await.unwrap();
+                        black_box(
+                            context
                                 .join_by_external_commit(
                                     group_info,
                                     MlsCustomConfiguration::default(),
@@ -112,10 +127,7 @@ fn join_from_group_info_bench(c: &mut Criterion) {
                                 .await
                                 .unwrap(),
                         );
-                        central
-                            .merge_pending_group_from_external_commit(&conversation_id)
-                            .await
-                            .unwrap();
+                        context.finish().await.unwrap();
                         black_box(());
                     },
                     BatchSize::SmallInput,
